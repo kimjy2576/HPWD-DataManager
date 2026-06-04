@@ -53,6 +53,10 @@ cd Dryer-Merger-main
 START.bat
 ```
 
+> ⚠️ **PowerShell**을 쓰는 경우 `START.bat` 대신 **`.\START.bat`** 로 입력하세요.
+> (PowerShell은 보안상 현재 폴더 스크립트를 이름만으론 실행하지 않음)
+> 또는 탐색기에서 `START.bat`을 **더블클릭**해도 됩니다.
+
 - 최초 실행 시 필요한 패키지 자동 설치 (2~3분)
 - 브라우저가 자동으로 열림 → **http://localhost:8001**
 
@@ -116,6 +120,8 @@ START.bat
 python run.py
 ```
 
+> ⚠️ **PowerShell**에서 `START.bat`이 인식 안 되면 **`.\START.bat`** 으로 입력.
+
 → **http://localhost:8001**
 
 ### 5. 업데이트 (최신 코드 받기)
@@ -173,14 +179,38 @@ pip install -r requirements.txt
 
 ---
 
+## CMD vs PowerShell 주의
+
+Windows에는 두 가지 명령창이 있습니다. 실행 방식이 다릅니다.
+
+| 창 종류 | `START.bat` 실행 방법 |
+|---------|----------------------|
+| **CMD** (명령 프롬프트) | `START.bat` (그냥 입력) |
+| **PowerShell** | `.\START.bat` (앞에 `.\` 필수) |
+
+PowerShell에서 그냥 `START.bat`을 입력하면 다음 오류가 납니다:
+```
+'START.bat' 용어가 cmdlet, 함수, 스크립트 파일 또는 실행할 수 있는
+프로그램 이름으로 인식되지 않습니다.
+```
+→ **해결: `.\START.bat`** 으로 입력 (PowerShell은 보안상 현재 폴더 스크립트를 이름만으론 실행 안 함)
+
+**가장 쉬운 방법 3가지:**
+1. `.\START.bat` 입력 (PowerShell)
+2. 탐색기에서 `START.bat` **더블클릭** (명령창 불필요)
+3. 폴더 주소창에 `cmd` 입력 → CMD 창이 그 폴더에서 열림 → `START.bat` 그냥 입력
+
+---
+
 ## 문제 해결
 
 | 증상 | 해결 |
 |------|------|
+| PowerShell에서 `START.bat` 인식 안 됨 | **`.\START.bat`** 으로 입력 (앞에 `.\` 추가) 또는 탐색기에서 더블클릭 |
 | `python`이 인식되지 않음 | Python 공식 버전 재설치 + "Add to PATH" 체크. 또는 `py run.py` |
 | `git`이 인식되지 않음 | Git for Windows 설치 후 CMD 재시작 |
 | `pip`이 인식되지 않음 | `python -m pip ...` 로 대체 |
-| `START.bat`이 인식 안 됨 | 폴더 위치 오류. `dir`로 `run.py` 보이는 폴더까지 진입 |
+| `START.bat`이 인식 안 됨 (CMD) | 폴더 위치 오류. `dir`로 `run.py` 보이는 폴더까지 진입 |
 | `ModuleNotFoundError: uvicorn` | `python -m pip install uvicorn[standard]` |
 | CoolProp 설치 실패 | Python 3.11 사용 (3.13 미지원) |
 | MX100 변수 안 잡힘 | `pip install xlrd` |
