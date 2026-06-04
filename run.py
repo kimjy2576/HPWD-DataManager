@@ -8,8 +8,17 @@ import os
 import webbrowser
 import threading
 import time
+import socket
 
-PORT = 8000
+def find_free_port(start=8001, tries=20):
+    """start부터 빈 포트를 찾아 반환. 모두 사용 중이면 start 반환."""
+    for p in range(start, start + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", p)) != 0:  # 연결 실패 = 빈 포트
+                return p
+    return start
+
+PORT = find_free_port(8001)
 IS_FROZEN = getattr(sys, "frozen", False)
 
 # PyInstaller 번들 경로 보정
@@ -34,7 +43,9 @@ def open_browser():
 if __name__ == "__main__":
     print(f"\n{'='*50}")
     print(f"  HPWD Data Manager — http://localhost:{PORT}")
-    print(f"  {'[EXE]' if IS_FROZEN else '[Python]'}")
+    print(f"  {'[EXE]' if IS_FROZEN else '[Python]'}  (포트 {PORT} 사용)")
+    if PORT != 8001:
+        print(f"  ※ 8001이 사용 중이라 {PORT}로 자동 변경됨")
     print(f"{'='*50}\n")
 
     threading.Thread(target=open_browser, daemon=True).start()

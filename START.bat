@@ -84,8 +84,10 @@ echo [4/4] HPWD Data Manager 시작!
 echo.
 echo ══════════════════════════════════════════
 echo   브라우저에서 자동으로 열립니다.
-echo   http://localhost:8000
+echo   http://localhost:8001
+echo   (8001 사용 중이면 8002, 8003... 자동 변경)
 echo.
+echo   실제 주소는 아래 CMD 로그에서 확인하세요.
 echo   종료: 이 창을 닫거나 Ctrl+C
 echo ══════════════════════════════════════════
 echo.
