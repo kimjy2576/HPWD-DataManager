@@ -157,6 +157,8 @@ def preprocess_ams(
 
     df = df_raw.copy()
     df.rename(columns=column_mapping, inplace=True)
+    # 한/중 전력 컬럼이 동시에 존재하면 rename 후 중복 발생 → 첫 번째만 유지
+    df = df.loc[:, ~df.columns.duplicated(keep="first")]
 
     # 스케일 변환 — 벡터화
     for col, factor in scale_factors.items():

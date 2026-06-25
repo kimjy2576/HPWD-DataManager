@@ -185,6 +185,8 @@ column_mappings:
     "행정 정보2(소 행정 정보)": "SubProcess"
     "전력": "Po_WD"
     "소비전력량": "E_WD"
+    "功率": "Po_WD"
+    "耗电": "E_WD"
     "wash_thermistor_temperature": "TM_Wash"
   blackrose:
     "HeatPump PressSwitch": "Heatpump_PressSwitch"
