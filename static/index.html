@@ -1492,7 +1492,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
   const addPlot=()=>{const rest=allVars.filter(k=>!tab.plots.includes(k));if(rest.length)updateTab({plots:[...tab.plots,rest[0]]})};
   const removePlot=(i)=>updateTab({plots:tab.plots.filter((_,j)=>j!==i)});
   const movePlot=(from,to)=>{if(from===to)return;const np=[...tab.plots];const[m]=np.splice(from,1);np.splice(to,0,m);updateTab({plots:np})};
-  const setYRange=(k,idx,val)=>{const yr={...(tab.yranges||{})};if(!yr[k])yr[k]=[null,null];yr[k][idx]=val===''?null:+val;updateTab({yranges:yr})};
+  const setYRange=(k,idx,val)=>{const yr={...(tab.yranges||{})};if(!yr[k])yr[k]=['',''];yr[k]=[...yr[k]];yr[k][idx]=val;updateTab({yranges:yr})};
   const clearYRange=(k)=>{const yr={...(tab.yranges||{})};delete yr[k];updateTab({yranges:yr})};
 
   // Fit
@@ -1735,7 +1735,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
         </div>
       </div>
       <div style={{maxHeight:'28vh',overflowY:'auto'}}>
-      {tab.plots.slice(0,tab.rows*tab.cols).map((k,i)=>{const yr=tab.yranges?.[k];const hasR=yr&&(yr[0]!=null||yr[1]!=null);
+      {tab.plots.slice(0,tab.rows*tab.cols).map((k,i)=>{const yr=tab.yranges?.[k];const hasR=yr&&((yr[0]!=null&&yr[0]!=='')||(yr[1]!=null&&yr[1]!==''));
         return(<div key={i} style={{padding:'4px 2px',borderBottom:'1px solid var(--bd)'}}>
         {/* 1행: 순서 버튼 + 번호 + 변수 선택 + 삭제 */}
         <div style={{display:'flex',alignItems:'center',gap:3}}>
@@ -1752,9 +1752,9 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
         {/* 2행: Y축 min/max (들여쓰기) */}
         <div style={{display:'flex',gap:3,alignItems:'center',marginTop:3,paddingLeft:22}}>
           <span style={{fontSize:8,color:'var(--tx3)',minWidth:18}}>Y</span>
-          <input value={yr?.[0]??''} onChange={e=>setYRange(k,0,e.target.value)} placeholder="min" title="Y축 최소" style={{width:50,fontSize:9,padding:'2px 3px',background:hasR?'rgba(59,130,246,.08)':'var(--bg)',border:'1px solid '+(hasR?'rgba(59,130,246,.3)':'var(--bd2)'),borderRadius:3,color:'var(--tx)',fontFamily:'var(--mono)',textAlign:'center'}}/>
+          <input type="text" inputMode="decimal" value={yr?.[0]??''} onChange={e=>setYRange(k,0,e.target.value)} placeholder="min" title="Y축 최소 (음수·소수 가능)" style={{width:50,fontSize:9,padding:'2px 3px',background:hasR?'rgba(59,130,246,.08)':'var(--bg)',border:'1px solid '+(hasR?'rgba(59,130,246,.3)':'var(--bd2)'),borderRadius:3,color:'var(--tx)',fontFamily:'var(--mono)',textAlign:'center'}}/>
           <span style={{fontSize:9,color:'var(--tx3)'}}>~</span>
-          <input value={yr?.[1]??''} onChange={e=>setYRange(k,1,e.target.value)} placeholder="max" title="Y축 최대" style={{width:50,fontSize:9,padding:'2px 3px',background:hasR?'rgba(59,130,246,.08)':'var(--bg)',border:'1px solid '+(hasR?'rgba(59,130,246,.3)':'var(--bd2)'),borderRadius:3,color:'var(--tx)',fontFamily:'var(--mono)',textAlign:'center'}}/>
+          <input type="text" inputMode="decimal" value={yr?.[1]??''} onChange={e=>setYRange(k,1,e.target.value)} placeholder="max" title="Y축 최대 (음수·소수 가능)" style={{width:50,fontSize:9,padding:'2px 3px',background:hasR?'rgba(59,130,246,.08)':'var(--bg)',border:'1px solid '+(hasR?'rgba(59,130,246,.3)':'var(--bd2)'),borderRadius:3,color:'var(--tx)',fontFamily:'var(--mono)',textAlign:'center'}}/>
           {hasR&&<button onClick={()=>clearYRange(k)} title="Y축 자동" style={{fontSize:9,border:0,background:0,color:'var(--blue)',cursor:'pointer',padding:'0 3px'}}>↺</button>}
         </div>
       </div>)})}
