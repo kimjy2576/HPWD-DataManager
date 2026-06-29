@@ -908,7 +908,7 @@ CALC_VARIABLES = [
     {"key": "T_Cond_In",       "label": "응축기 냉매 입구 온도",  "unit": "°C",  "category": "냉매 온도", "required": True,  "default_match": ["T_Cond_In", "T_Comp_Out", "Heatpump_CompTemp"]},
     {"key": "T_Cond_Out",      "label": "응축기 냉매 출구 온도",  "unit": "°C",  "category": "냉매 온도", "required": True,  "default_match": ["T_Cond_Out"]},
     {"key": "T_Cond_Mid",      "label": "응축기 냉매 중간 온도",  "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Cond_Mid", "T_Cond_M1"]},
-    {"key": "T_Comp_Body",     "label": "압축기 본체 온도",      "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_Body", "Heatpump_CompTemp", "T_Comp_Out"]},
+    {"key": "T_Comp_Body",     "label": "압축기 토출 온도(바디)",   "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_Body", "Heatpump_CompTemp", "T_Comp_Out"]},
     {"key": "T_Eva_Out",       "label": "증발기 냉매 출구 온도",  "unit": "°C",  "category": "냉매 온도", "required": True,  "default_match": ["T_Eva_Out", "Heatpump_EvaOutTemp"]},
     {"key": "T_Comp_In",       "label": "압축기 흡입 온도",      "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_In", "Heatpump_EvaOutTemp", "T_Eva_Out"]},
     {"key": "T_Comp_Out",      "label": "압축기 토출 온도",      "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_Out", "T_Cond_In"]},
