@@ -784,10 +784,13 @@ def _calc_evaporator_air_and_performance(df, props, patm, rh_eva_out, air_cond, 
     water_gm = water_gs * 60
     water_kg = np.cumsum(water_gm * (dt / 60) / 1000)
 
-    # RMC 보정
+    # RMC 계산 (IMC/FMC 앵커링, 순수 affine)
     rmc = np.zeros_like(water_kg)
     if exp and exp.get("imc_kg") and exp.get("load_kg"):
-        rmc = _calc_rmc(water_kg, exp["imc_kg"], exp["fmc_kg"], exp["load_kg"])
+        smooth_cfg = (cfg or {}).get("calculation", {}).get("rmc_smoothing") \
+            if cfg else None
+        rmc = _calc_rmc(water_kg, exp["imc_kg"], exp["fmc_kg"], exp["load_kg"],
+                        smooth_cfg=smooth_cfg)
 
     # ── 드럼 열전달 (응축기출구 → 드럼 → 증발기입구) ──
     # 드럼 입구 = 응축기 공기 출구
@@ -844,8 +847,19 @@ def _calc_evaporator_air_and_performance(df, props, patm, rh_eva_out, air_cond, 
     }
 
 
-def _calc_rmc(water_kg, imc, fmc, load):
-    """RMC 보정 (가중치 + 단조증가 + 스무딩)."""
+def _calc_rmc(water_kg, imc, fmc, load, smooth_cfg=None):
+    """RMC 계산 — IMC/FMC 앵커링 (순수 affine 변환).
+
+    wf = (IMC - FMC) / 계산응축수_총량
+    adj = 누적응축수 × wf
+    RMC = ((IMC - adj) / load - 1) × 100
+
+    → 선형(affine) 변환이므로 보정 전후 커브 개형이 완전히 동일함.
+      y축 스케일만 IMC/FMC 실측값에 맞게 재조정됨.
+
+    스무딩은 기본 OFF. 켜면 이동평균 + 단조증가 + 최종값 클리핑이 적용되어
+    커브 개형이 왜곡되므로(꼬리 평탄화, 변곡점 소실) 주의.
+    """
     actual_delta = imc - fmc
     calc_delta = water_kg[-1] - water_kg[0]
     wf = actual_delta / calc_delta if calc_delta != 0 else 1.0
@@ -854,20 +868,23 @@ def _calc_rmc(water_kg, imc, fmc, load):
     current_mass = imc - adj
     rmc = ((current_mass / load) - 1) * 100
 
-    # 스무딩
-    win = min(15, len(rmc) // 4)
-    if win > 1:
-        kernel = np.ones(win) / win
-        raw_water = imc - (rmc / 100 + 1) * load
-        smooth = np.convolve(raw_water, kernel, mode="same")
-        pad = min(5, len(smooth) // 4)
-        if pad > 0 and len(smooth) > pad * 2:
-            smooth[:pad] = np.linspace(raw_water[0], smooth[pad], pad)
-            smooth[-pad:] = np.linspace(smooth[-pad], raw_water[-1], pad)
-        smooth = np.maximum.accumulate(smooth)
-        smooth = np.minimum(smooth, raw_water[-1])
-        smooth[-1] = raw_water[-1]
-        rmc = ((imc - smooth) / load - 1) * 100
+    # ── (옵션) 스무딩 — 기본 비활성 ──
+    if smooth_cfg and smooth_cfg.get("enabled", False):
+        win = int(smooth_cfg.get("window", 15))
+        win = min(win, len(rmc) // 4)
+        if win > 1:
+            kernel = np.ones(win) / win
+            raw_water = imc - (rmc / 100 + 1) * load
+            smooth = np.convolve(raw_water, kernel, mode="same")
+            pad = min(5, len(smooth) // 4)
+            if pad > 0 and len(smooth) > pad * 2:
+                smooth[:pad] = np.linspace(raw_water[0], smooth[pad], pad)
+                smooth[-pad:] = np.linspace(smooth[-pad], raw_water[-1], pad)
+            if smooth_cfg.get("monotonic", False):
+                smooth = np.maximum.accumulate(smooth)
+                smooth = np.minimum(smooth, raw_water[-1])
+                smooth[-1] = raw_water[-1]
+            rmc = ((imc - smooth) / load - 1) * 100
 
     return np.round(rmc, 2)
 
