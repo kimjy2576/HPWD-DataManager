@@ -721,16 +721,24 @@ return(<div>
       <input type="checkbox" checked={cfg?.calculation?.use_imc_correction!==false} onChange={async e=>{
         const v=e.target.checked;
         const prev=cfg;
-        // ① 낙관적 업데이트: 로컬 state 즉시 반영 (체크박스가 바로 반응)
-        setCfg(p=>({...p,calculation:{...(p?.calculation||{}),use_imc_correction:v}}));
+        // ① 낙관적 업데이트 (체크박스 즉시 반응)
+        const next={...cfg,calculation:{...(cfg?.calculation||{}),use_imc_correction:v}};
+        setCfg(next);
         try{
+          // ② 로컬 cfg 기반으로 직접 PUT (GET→mutate 레이스 제거)
+          const put=await fetch(`${API}/api/config`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(next)});
+          if(!put.ok)throw new Error(`HTTP ${put.status}`);
+          // ③ 서버 값으로 재동기화 (진실 확인)
           const r=await fetch(`${API}/api/config`);
-          const c=await r.json();
-          c.calculation.use_imc_correction=v;
-          const put=await fetch(`${API}/api/config`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
-          if(!put.ok)throw new Error('저장 실패');
+          const server=await r.json();
+          setCfg(server);
+          const saved=server?.calculation?.use_imc_correction;
+          if((saved!==false)!==v){
+            console.warn('[IMC] 서버 저장값 불일치:',{요청:v,저장됨:saved});
+            alert(`설정이 서버에 반영되지 않았습니다.\n요청: ${v} / 저장됨: ${saved}`);
+          }
         }catch(err){
-          setCfg(prev);  // ② 실패 시 롤백
+          setCfg(prev);  // ④ 실패 시 롤백
           alert('설정 저장 실패: '+err.message);
         }
       }} style={{accentColor:'var(--teal)',width:15,height:15}}/>
