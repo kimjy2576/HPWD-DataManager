@@ -19,6 +19,21 @@ from config import load_config
 app = FastAPI(title="HPWD Data Manager", version="5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+@app.middleware("http")
+async def no_cache_static(request, call_next):
+    """index.html / static 파일 캐시 차단.
+
+    업데이트 후에도 브라우저가 예전 index.html을 캐시해서
+    새 코드가 반영되지 않는 문제 방지.
+    """
+    resp = await call_next(request)
+    p = request.url.path
+    if p == "/" or p.startswith("/static"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -1480,10 +1495,32 @@ def _deep_merge_config(new_cfg, user_cfg):
     return result
 
 
+@app.get("/api/version")
+def version_info():
+    """실행 중인 index.html의 수정 시각/해시 — 캐시 확인용."""
+    import hashlib, datetime as _dt
+    f = STATIC / "index.html"
+    if not f.exists():
+        return {"exists": False}
+    raw = f.read_bytes()
+    return {
+        "exists": True,
+        "mtime": _dt.datetime.fromtimestamp(f.stat().st_mtime).isoformat(timespec="seconds"),
+        "size": len(raw),
+        "sha1": hashlib.sha1(raw).hexdigest()[:12],
+    }
+
+
 @app.get("/")
 def index():
     f = STATIC / "index.html"
-    return HTMLResponse(f.read_text("utf-8")) if f.exists() else HTMLResponse("<h1>HPWD Data Manager</h1>")
+    if not f.exists():
+        return HTMLResponse("<h1>HPWD Data Manager</h1>")
+    resp = HTMLResponse(f.read_text("utf-8"))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 if STATIC.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
