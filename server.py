@@ -1393,10 +1393,24 @@ def get_version():
 
 @app.post("/api/update")
 def self_update():
-    """GitHub에서 최신 코드 다운로드 + 서버 재시작. Setting 값은 유지됨."""
-    import subprocess, zipfile, io, shutil
+    """git으로 최신 코드 받기 + 서버 재시작. Setting 값은 유지됨.
+
+    저장소가 비공개(HPWD-DataManager)로 통일되어 익명 ZIP 다운로드가 불가하므로
+    git fetch + reset --hard origin/main 방식을 사용한다.
+    (results/, config/saves/ 등 untracked 파일은 reset --hard로 삭제되지 않음)
+    """
+    import subprocess
     import yaml as _yaml
-    repo_url = "https://github.com/kimjy2576/Dryer-Merger/archive/refs/heads/main.zip"
+
+    git_dir = BASE_DIR / ".git"
+    if not git_dir.exists():
+        return {"status": "error",
+                "message": "git 저장소가 아닙니다. git clone 으로 설치했는지 확인하세요.\n"
+                           "  git clone https://github.com/kimjy2576/HPWD-DataManager.git"}
+
+    def _git(*args, timeout=60):
+        return subprocess.run(["git", *args], cwd=str(BASE_DIR),
+                              capture_output=True, text=True, timeout=timeout)
 
     try:
         # 0. 현재 설정 백업 (머지용)
@@ -1406,41 +1420,25 @@ def self_update():
             try:
                 with open(cfg_path, "r", encoding="utf-8") as f:
                     user_cfg = _yaml.safe_load(f)
-            except: pass
+            except Exception:
+                pass
 
-        # 1. 다운로드
-        import urllib.request
-        resp = urllib.request.urlopen(repo_url, timeout=30)
-        zip_data = resp.read()
+        before = _git("rev-parse", "--short", "HEAD").stdout.strip()
 
-        # 2. 임시 폴더에 압축 해제
-        tmp = BASE_DIR / "_update_tmp"
-        if tmp.exists():
-            shutil.rmtree(tmp)
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
-            zf.extractall(tmp)
+        # 1. 원격 최신 가져오기
+        r = _git("fetch", "origin", "main", timeout=90)
+        if r.returncode != 0:
+            return {"status": "error",
+                    "message": f"git fetch 실패 (인증 문제일 수 있음):\n{r.stderr.strip()[:400]}"}
 
-        # 3. 압축 해제된 폴더 찾기
-        extracted = list(tmp.iterdir())
-        src = extracted[0] if len(extracted) == 1 and extracted[0].is_dir() else tmp
+        # 2. 로컬을 원격 상태로 강제 동기화 (tracked 파일만 덮어씀)
+        r = _git("reset", "--hard", "origin/main")
+        if r.returncode != 0:
+            return {"status": "error", "message": f"git reset 실패:\n{r.stderr.strip()[:400]}"}
 
-        # 4. 파일 덮어쓰기 (config/saves는 보존)
-        preserve = {"config/saves", "results", "_update_tmp"}
-        updated = []
-        for item in src.rglob("*"):
-            rel = item.relative_to(src)
-            # 보존 폴더 스킵
-            if any(str(rel).startswith(p) for p in preserve):
-                continue
-            dest = BASE_DIR / rel
-            if item.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(str(item), str(dest))
-                updated.append(str(rel))
+        after = _git("rev-parse", "--short", "HEAD").stdout.strip()
 
-        # 4.5. 설정 머지 (유저 값 우선, 새로 추가된 키만 default에서 가져옴)
+        # 3. 설정 머지 (유저 값 우선, 새 키만 default에서)
         if user_cfg and cfg_path.exists():
             try:
                 with open(cfg_path, "r", encoding="utf-8") as f:
@@ -1449,21 +1447,25 @@ def self_update():
                 with open(cfg_path, "w", encoding="utf-8") as f:
                     _yaml.safe_dump(merged_cfg, f, allow_unicode=True,
                                     sort_keys=False, default_flow_style=False)
-                print(f"[update] Setting 값 유지 (유저 설정 머지 완료)")
+                print("[update] Setting 값 유지 (유저 설정 머지 완료)")
             except Exception as e:
                 print(f"[update] 설정 머지 실패: {e} (새 default 사용)")
 
-        # 5. 임시 폴더 삭제
-        shutil.rmtree(tmp, ignore_errors=True)
+        if before == after:
+            return {"status": "uptodate", "commit": after,
+                    "message": f"이미 최신입니다 ({after}). 재시작하지 않음."}
 
-        # 6. 서버 재시작 (백그라운드)
+        # 4. 서버 재시작 (백그라운드)
         import threading
         def restart():
             import time; time.sleep(1)
-            os._exit(0)  # uvicorn이 재시작
+            os._exit(0)  # run.py의 루프가 uvicorn 재시작
         threading.Thread(target=restart, daemon=True).start()
 
-        return {"status": "updated", "files": len(updated), "message": "서버 재시작 중... Setting 값 유지됨."}
+        return {"status": "updated", "before": before, "after": after,
+                "message": f"업데이트 완료 ({before} → {after}). 서버 재시작 중... Setting 값 유지됨."}
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "git 명령 시간 초과 (네트워크 확인)"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1495,9 +1497,9 @@ def _deep_merge_config(new_cfg, user_cfg):
     return result
 
 
-@app.get("/api/version")
-def version_info():
-    """실행 중인 index.html의 수정 시각/해시 — 캐시 확인용."""
+@app.get("/api/build")
+def build_info():
+    """실행 중인 index.html의 수정 시각/해시 — 브라우저 캐시 확인용."""
     import hashlib, datetime as _dt
     f = STATIC / "index.html"
     if not f.exists():
