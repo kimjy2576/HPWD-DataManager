@@ -75,7 +75,7 @@ return(<div className="app"><div className="hdr" style={{display:'flex',alignIte
   <button className={`tb ${tab==='config'?'on':''}`} onClick={()=>setTab('config')}>Setting</button>
 </div>
 <div style={{display:tab==='merge'?'block':'none'}}>{cfg&&<MergeTab cfg={cfg} sid={sid} setSid={setSid} st={mergeSt} setSt={setMergeSt} setTab={setTab} setCalcAutoFiles={setCalcAutoFiles}/>}</div>
-<div style={{display:tab==='calc'?'block':'none'}}>{cfg&&<CalcTab cfg={cfg} sid={sid} setSid={setSid} st={calcSt} setSt={setCalcSt} setTab={setTab} setViewerAutoLoad={setViewerAutoLoad} calcAutoFiles={calcAutoFiles} clearCalcAutoFiles={()=>setCalcAutoFiles(null)}/>}</div>
+<div style={{display:tab==='calc'?'block':'none'}}>{cfg&&<CalcTab cfg={cfg} setCfg={setCfg} sid={sid} setSid={setSid} st={calcSt} setSt={setCalcSt} setTab={setTab} setViewerAutoLoad={setViewerAutoLoad} calcAutoFiles={calcAutoFiles} clearCalcAutoFiles={()=>setCalcAutoFiles(null)}/>}</div>
 <div style={{display:tab==='formula'?'block':'none'}}><FormulaTab/></div>
 <div style={{display:tab==='viewer'?'block':'none'}}><ViewerTab cfg={cfg} autoLoad={viewerAutoLoad} clearAutoLoad={()=>setViewerAutoLoad(null)}/></div>
 <div style={{display:tab==='config'?'block':'none'}}>{cfg&&<CfgTab cfg={cfg} setCfg={setCfg}/>}</div>
@@ -473,7 +473,7 @@ return(<div>
 </div>)}
 
 // ═══ Calc 탭 ═══
-function CalcTab({cfg,sid,setSid,st,setSt,setTab,setViewerAutoLoad,calcAutoFiles,clearCalcAutoFiles}){
+function CalcTab({cfg,setCfg,sid,setSid,st,setSt,setTab,setViewerAutoLoad,calcAutoFiles,clearCalcAutoFiles}){
 const[poll,setPoll]=useState(false);const pr=useRef();
 const[results,setResults]=useState([]);
 const[selFiles,setSelFiles]=useState(new Set());
@@ -718,10 +718,21 @@ return(<div>
   {/* IMC 보정 옵션 */}
   <div className="cd" style={{padding:'10px 14px'}}>
     <label style={{display:'flex',alignItems:'center',gap:8,fontSize:12,cursor:'pointer'}}>
-      <input type="checkbox" checked={cfg?.calculation?.use_imc_correction!==false} onChange={e=>{
+      <input type="checkbox" checked={cfg?.calculation?.use_imc_correction!==false} onChange={async e=>{
         const v=e.target.checked;
-        fetch(`${API}/api/config`).then(r=>r.json()).then(c=>{c.calculation.use_imc_correction=v;
-          fetch(`${API}/api/config`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)})})
+        const prev=cfg;
+        // ① 낙관적 업데이트: 로컬 state 즉시 반영 (체크박스가 바로 반응)
+        setCfg(p=>({...p,calculation:{...(p?.calculation||{}),use_imc_correction:v}}));
+        try{
+          const r=await fetch(`${API}/api/config`);
+          const c=await r.json();
+          c.calculation.use_imc_correction=v;
+          const put=await fetch(`${API}/api/config`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(c)});
+          if(!put.ok)throw new Error('저장 실패');
+        }catch(err){
+          setCfg(prev);  // ② 실패 시 롤백
+          alert('설정 저장 실패: '+err.message);
+        }
       }} style={{accentColor:'var(--teal)',width:15,height:15}}/>
       <span style={{fontWeight:500}}>🔧 IMC/FMC 기반 유량 보정</span>
       <span style={{fontSize:10,color:'var(--tx3)'}}>체크 시: 응축수량을 실측값(IMC-FMC)에 맞춰 비례보정 → 냉매 유량 역산 → COP 등 재계산 (IMC/FMC 입력 필요)</span>
