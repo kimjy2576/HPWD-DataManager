@@ -690,6 +690,27 @@ def _apply_imc_full(df, cfg, props, patm, rh_eva_out,
         df, props, patm, rh_eva_out, air_cond,
         flow_corr, time_interval, exp, cfg)
 
+    # ── water_kg 최종값을 IMC-FMC로 직접 앵커링 ──
+    # RH 미측정 시 water_gs는 Q_eva/L 형태로 역산되어 유량 scale이 상쇄됨.
+    # → 유량 보정만으로는 누적 응축수 최종값이 (IMC-FMC)에 수렴하지 않음
+    # → 커브 개형(물리 모델)은 유지하되 최종값만 실측 제거량에 맞춰 재스케일
+    wk = perf_corr.get("water_kg")
+    if wk is not None and len(wk) > 0 and wk[-1] > 0:
+        anchor = total_real / wk[-1]   # 최종값 = IMC-FMC 가 되도록
+        perf_corr["water_kg"] = wk * anchor
+        if "water_gm" in perf_corr:
+            perf_corr["water_gm"] = perf_corr["water_gm"] * anchor
+        if "water_gs" in perf_corr:
+            perf_corr["water_gs"] = perf_corr["water_gs"] * anchor
+        # RMC를 앵커링된 water_kg로 재계산 (일관성)
+        if exp.get("imc_kg") and exp.get("load_kg"):
+            smooth_cfg = (cfg or {}).get("calculation", {}).get("rmc_smoothing") if cfg else None
+            perf_corr["rmc"] = _calc_rmc(perf_corr["water_kg"],
+                                         exp["imc_kg"], exp["fmc_kg"], exp["load_kg"],
+                                         smooth_cfg=smooth_cfg)
+        info["water_anchor"] = float(anchor)
+        info["water_final_kg"] = float(perf_corr["water_kg"][-1])
+
     return flow_corr, perf_corr, info
 
 
