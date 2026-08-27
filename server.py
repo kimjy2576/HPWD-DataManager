@@ -279,6 +279,49 @@ def select_cases(req: SelectRequest):
     return {"session_id": sid, "cases": case_files}
 
 
+def _peek_header(path: Path, skip_rows: int = 1) -> str:
+    """CSV 헤더 행을 문자열로 반환 (인코딩 자동 시도). 실패 시 빈 문자열."""
+    for enc in ("utf-8-sig", "utf-8", "cp949", "latin1"):
+        try:
+            with open(path, "r", encoding=enc, errors="strict") as f:
+                for _ in range(max(0, skip_rows)):
+                    f.readline()
+                return (f.readline() or "").lower()
+        except Exception:
+            continue
+    return ""
+
+
+# 소스별 헤더 시그니처 (하나라도 있으면 해당 소스로 판정)
+_SIG = {
+    "ams": ["compcurrenthz", "eevcurrentposition", "_dry_duct_in_temp_",
+            "_dry_eva_in_temp_", "requestrpm", "currentrpm",
+            "superheatdegree", "功率", "耗电", "행정 정보"],
+    "br": ["d_currentabs", "ctrl_", "hp_", "t_air_", "p_comp"],
+}
+
+
+def _sniff_source(path: Path, file_rules: dict, candidates=("ams", "br")) -> str | None:
+    """헤더 내용으로 소스 판별. 확실하지 않으면 None."""
+    if path.suffix.lower() != ".csv":
+        return None
+    scores = {}
+    for src in candidates:
+        skip = (file_rules.get(src, {}) or {}).get("skip_rows", 1)
+        head = _peek_header(path, skip)
+        if not head:
+            continue
+        scores[src] = sum(1 for sig in _SIG.get(src, []) if sig in head)
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+    # 최소 2개 이상 매칭 + 2위와 차이가 있어야 확정
+    others = [v for k, v in scores.items() if k != best]
+    if scores[best] >= 2 and (not others or scores[best] > max(others)):
+        return best
+    return None
+
+
 def _classify_files(folder: Path, file_rules: dict = None, active_sources: list = None) -> dict:
     """파일 식별 규칙에 따라 소스별 분류. active_sources로 필터."""
     if not file_rules:
@@ -312,6 +355,15 @@ def _classify_files(folder: Path, file_rules: dict = None, active_sources: list 
                 continue
             if exc and any(p.lower() in n for p in exc):
                 continue
+            # br(폴백)로 잡힌 csv는 헤더 내용으로 재판별
+            #   → 파일명에 _ams 가 없어도 AMS 파일을 올바르게 인식
+            if src == "br" and "ams" in file_rules:
+                sniff = _sniff_source(f, file_rules)
+                if sniff and sniff != "br":
+                    files[sniff].append(f.name)
+                    print(f"  [classify] 내용 판별: {f.name} → {sniff.upper()}")
+                    matched = True
+                    break
             files[src].append(f.name)
             matched = True
             break
