@@ -12,6 +12,77 @@ import threading
 import time
 import socket
 
+REQUIRED = [
+    ("fastapi",   "fastapi>=0.104"),
+    ("uvicorn",   "uvicorn[standard]>=0.24"),
+    ("multipart", "python-multipart>=0.0.6"),
+    ("pandas",    "pandas>=2.0"),
+    ("numpy",     "numpy>=1.24"),
+    ("CoolProp",  "CoolProp>=6.4"),
+    ("dateutil",  "python-dateutil>=2.8"),
+    ("yaml",      "PyYAML>=6.0"),
+    ("openpyxl",  "openpyxl>=3.1"),
+    ("xlrd",      "xlrd>=2.0"),
+    ("scipy",     "scipy>=1.11"),
+]
+
+
+def _pip(*args):
+    """pip 실행 — 실패 시 --user 로 재시도."""
+    import subprocess
+    cmd = [sys.executable, "-m", "pip", "install", *args]
+    if subprocess.run(cmd).returncode == 0:
+        return True
+    print("   → --user 옵션으로 재시도...")
+    return subprocess.run(cmd + ["--user"]).returncode == 0
+
+
+def ensure_deps():
+    """필수 패키지 확인 후 없는 것만 자동 설치. EXE 모드는 건너뜀."""
+    if getattr(sys, "frozen", False):
+        return
+
+    import importlib.util
+    missing = [(m, spec) for m, spec in REQUIRED
+               if importlib.util.find_spec(m) is None]
+    if not missing:
+        return
+
+    print("\n" + "=" * 56)
+    print(f"  누락된 패키지 {len(missing)}개 설치 (최초 1회, 2~3분)")
+    print("  " + ", ".join(m for m, _ in missing))
+    print("=" * 56 + "\n")
+
+    _pip("--upgrade", "pip")   # wheel 설치 실패 방지
+
+    failed = []
+    for mod, spec in missing:
+        print(f"\n[설치] {spec}")
+        if not _pip(spec):
+            failed.append(spec)
+            continue
+        importlib.invalidate_caches()
+        if importlib.util.find_spec(mod) is None:
+            failed.append(spec)
+
+    if not failed:
+        print("\n[설치] 완료\n")
+        return
+
+    print("\n" + "!" * 56)
+    print("  다음 패키지 설치에 실패했습니다:")
+    for spec in failed:
+        print(f"    - {spec}")
+    if any(s.startswith("CoolProp") for s in failed):
+        v = f"{sys.version_info.major}.{sys.version_info.minor}"
+        print("\n  ※ CoolProp은 Python 3.13+ 에서 wheel이 제공되지 않습니다.")
+        print(f"     현재 Python {v}  →  3.11 사용을 권장합니다.")
+        print("     https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe")
+    print("\n  수동 설치: python -m pip install -r requirements.txt")
+    print("!" * 56 + "\n")
+    input("계속하려면 Enter (오류가 날 수 있음)...")
+
+
 def find_free_port(start=8001, tries=20):
     """start부터 빈 포트를 찾아 반환. 모두 사용 중이면 start 반환."""
     for p in range(start, start + tries):
@@ -59,6 +130,8 @@ def open_browser():
 
 
 if __name__ == "__main__":
+    ensure_deps()
+
     print(f"\n{'='*56}")
     print(f"  HPWD Data Manager  {'[EXE]' if IS_FROZEN else '[Python]'}")
     print(f"{'='*56}")

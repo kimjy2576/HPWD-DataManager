@@ -24,23 +24,7 @@ if errorlevel 1 goto OLDPY
 for /f "delims=" %%v in ('python -c "import sys;print(sys.version.split()[0])"') do echo [1/3] Python %%v
 echo.
 
-rem ── 2. 패키지 ──
-echo [2/3] 패키지 확인 중...
-python -c "import fastapi,uvicorn,pandas,numpy,CoolProp,yaml,scipy,openpyxl,xlrd" >nul 2>&1
-if not errorlevel 1 goto PKGOK
-echo       설치 중... (최초 1회, 2~3분)
-if exist "requirements.txt" goto PIPREQ
-python -m pip install fastapi uvicorn[standard] pyyaml pandas numpy CoolProp scipy openpyxl xlrd --quiet
-goto PIPDONE
-:PIPREQ
-python -m pip install -r requirements.txt --quiet
-:PIPDONE
-if errorlevel 1 goto PIPFAIL
-echo       설치 완료
-goto PKGDONE
-:PKGOK
-echo       확인됨
-:PKGDONE
+echo [2/3] 패키지는 run.py 가 자동 확인/설치합니다
 echo.
 
 rem ── 3. 방화벽 ──
@@ -104,9 +88,3 @@ popd
 pause
 exit /b 1
 
-:PIPFAIL
-echo [오류] 패키지 설치 실패
-echo   수동 실행: python -m pip install -r requirements.txt
-popd
-pause
-exit /b 1
