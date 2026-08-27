@@ -42,7 +42,7 @@ file_rules:
     extensions: [".csv"]
     include_patterns: ["_ams"]
     exclude_patterns: []
-    skip_rows: 1
+    skip_rows: 0
     encoding: "utf-8"
   br:
     extensions: [".csv"]
