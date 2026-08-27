@@ -215,9 +215,18 @@ def sync_and_merge(
     [v3 최적화] reindex를 한번에 처리, ref_df 이중 변환 제거.
     """
     ref_map = {"BR": df_br, "AMS": df_ams, "MX100": df_mx100}
-    ref_df = ref_map[data_time]
+    ref_df = ref_map.get(data_time, pd.DataFrame())
+    # 지정된 기준 소스가 비어 있으면 사용 가능한 다른 소스로 자동 폴백
     if ref_df.empty or "Time" not in ref_df.columns:
-        return pd.DataFrame({"Time": [0]})
+        for alt in ["BR", "AMS", "MX100"]:
+            cand = ref_map.get(alt, pd.DataFrame())
+            if not cand.empty and "Time" in cand.columns:
+                print(f"  [sync] 기준 시간축 '{data_time}' 없음 → '{alt}'로 자동 전환")
+                data_time, ref_df = alt, cand
+                break
+    if ref_df.empty or "Time" not in ref_df.columns:
+        print("  [sync] 사용 가능한 시간축 소스가 없음")
+        return pd.DataFrame({"Time": pd.to_datetime([])})
 
     start_time = parse_flexible_datetime(ref_df["Time"].iloc[0])
     print(f"  [sync] 기준시간: {start_time}, data_time={data_time}")
@@ -309,18 +318,52 @@ def sync_and_merge(
 #  시간 열 부가 (Time_sec, Time_min)
 # ══════════════════════════════════════════════
 def add_time_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Time 열 기준으로 Time_sec, Time_min 열 추가/재계산."""
-    t0 = df["Time"].iloc[0]
-    time_sec = (df["Time"] - t0).dt.total_seconds()
-    time_sec = time_sec - time_sec.iloc[0]
+    """Time 열 기준으로 Time_sec, Time_min 열 추가/재계산.
+
+    Time 이 datetime 이 아닐 수도 있으므로(문자열 HH:MM:SS, 경과초 등)
+    형식을 판별해 초 단위로 환산한다.
+    """
+    if "Time" not in df.columns or len(df) == 0:
+        df["Time_sec"] = pd.Series(dtype=float)
+        df["Time_min"] = pd.Series(dtype=float)
+        return df
+
+    s = df["Time"]
+
+    if pd.api.types.is_datetime64_any_dtype(s):
+        time_sec = (s - s.iloc[0]).dt.total_seconds()
+    elif pd.api.types.is_timedelta64_dtype(s):
+        time_sec = s.dt.total_seconds()
+    elif pd.api.types.is_numeric_dtype(s):
+        # 이미 경과 시간(초)로 들어온 경우
+        time_sec = pd.to_numeric(s, errors="coerce").astype(float)
+        print("  [time] Time 이 숫자형 — 경과초로 간주")
+    else:
+        conv = pd.to_datetime(s, errors="coerce")
+        if conv.notna().sum() >= max(1, int(len(conv) * 0.5)):
+            time_sec = (conv - conv.dropna().iloc[0]).dt.total_seconds()
+            df["Time"] = conv
+        else:
+            num = pd.to_numeric(s, errors="coerce")
+            if num.notna().sum() > 0:
+                time_sec = num.astype(float)
+                print("  [time] Time 파싱 실패 — 숫자 경과초로 대체")
+            else:
+                print("  [time] Time 파싱 불가 — 행 인덱스를 초로 사용")
+                time_sec = pd.Series(range(len(df)), index=df.index, dtype=float)
+
+    time_sec = time_sec.astype(float)
+    first = time_sec.dropna().iloc[0] if time_sec.notna().any() else 0.0
+    time_sec = time_sec - first
     time_min = (time_sec / 60).round(2)
+
     # 이미 있으면 재계산, 없으면 새로 삽입
     if "Time_sec" in df.columns:
         df["Time_sec"] = time_sec
     else:
-        df.insert(1, "Time_sec", time_sec)
+        df.insert(min(1, len(df.columns)), "Time_sec", time_sec)
     if "Time_min" in df.columns:
         df["Time_min"] = time_min
     else:
-        df.insert(2, "Time_min", time_min)
+        df.insert(min(2, len(df.columns)), "Time_min", time_min)
     return df
