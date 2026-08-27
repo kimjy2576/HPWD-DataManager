@@ -12,6 +12,19 @@ import threading
 import time
 import socket
 
+# Windows 콘솔 한글 출력 보장 (cp949 환경에서 UnicodeEncodeError 방지)
+if os.name == "nt":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+    except Exception:
+        pass
+
 REQUIRED = [
     ("fastapi",   "fastapi>=0.104"),
     ("uvicorn",   "uvicorn[standard]>=0.24"),
@@ -95,6 +108,34 @@ def ensure_deps():
     input("계속하려면 Enter (오류가 날 수 있음)...")
 
 
+def ensure_firewall():
+    """Windows 방화벽에 포트 8001~8010 인바운드 허용 규칙 등록 (공유 모드 전용)."""
+    if os.name != "nt":
+        return
+    import subprocess
+    name = "HPWD Data Manager"
+    try:
+        chk = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"],
+            capture_output=True, timeout=15)
+        if chk.returncode == 0:
+            print("  방화벽: 규칙 확인됨")
+            return
+        add = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={name}", "dir=in", "action=allow",
+             "protocol=TCP", "localport=8001-8010"],
+            capture_output=True, timeout=15)
+        if add.returncode == 0:
+            print("  방화벽: 규칙 추가됨 (포트 8001~8010)")
+        else:
+            print("  방화벽: 규칙 없음 (관리자 권한 아님)")
+            print("          방화벽 팝업이 뜨면 [액세스 허용] 클릭")
+            print("          또는 run.bat 우클릭 → 관리자 권한으로 실행 (최초 1회)")
+    except Exception:
+        print("  방화벽: 확인 실패 (수동 허용 필요할 수 있음)")
+
+
 def find_free_port(start=8001, tries=20):
     """start부터 빈 포트를 찾아 반환. 모두 사용 중이면 start 반환."""
     for p in range(start, start + tries):
@@ -143,6 +184,8 @@ def open_browser():
 
 if __name__ == "__main__":
     ensure_deps()
+    if SHARE:
+        ensure_firewall()
 
     print(f"\n{'='*56}")
     print(f"  HPWD Data Manager  {'[EXE]' if IS_FROZEN else '[Python]'}")
