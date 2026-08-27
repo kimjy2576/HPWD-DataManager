@@ -11,32 +11,72 @@ from properties import get_props
 
 
 def run_stage1(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
-    """Stage 1 계산 실행."""
+    """Stage 1 계산 실행.
+
+    개별 계산에 필요한 컬럼이 없으면 그 계산만 건너뛰고 진행한다.
+    (일부 소스만 병합된 경우에도 Merge 자체는 성공해야 함)
+    """
     setup = cfg["processing"].get("setup_type", "BR")
     env = cfg["environment"]
     props = get_props(env["refrigerant"], env["patm"], env.get("backend", "HEOS"))
 
+    def _try(label, fn):
+        try:
+            return fn()
+        except KeyError as e:
+            print(f"  [stage1] {label} 건너뜀 — 필요한 {e}")
+        except Exception as e:
+            print(f"  [stage1] {label} 실패 — {type(e).__name__}: {e}")
+        return None
+
     if setup == "MX100":
-        df = _derive_missing_mx100(df)
+        out = _try("MX100 유도", lambda: _derive_missing_mx100(df))
+        if out is not None:
+            df = out
     elif setup == "BR":
-        df = _clamp_divergent(df)
-        df["fTemp_calc"] = _calc_ftemp(df, cfg["ftemp"])
-        df = _calc_pressures(df, props, env["patm"])
-        df = _calc_discharge_superheat(df, props)
+        out = _try("발산값 보정", lambda: _clamp_divergent(df))
+        if out is not None:
+            df = out
+
+        ft = _try("fTemp 계산", lambda: _calc_ftemp(df, cfg["ftemp"]))
+        if ft is not None:
+            df["fTemp_calc"] = ft
+
+        out = _try("압력 추정", lambda: _calc_pressures(df, props, env["patm"]))
+        if out is not None:
+            df = out
+
+        out = _try("토출 과열도", lambda: _calc_discharge_superheat(df, props))
+        if out is not None:
+            df = out
 
     return df
 
 
-def _col(df, *names):
-    """여러 이름 중 존재하는 첫 컬럼 반환."""
+def _col(df, *names, required=True, default=None):
+    """여러 이름 중 존재하는 첫 컬럼 반환. required=False면 default 반환."""
     for n in names:
-        if n in df.columns: return df[n].values
-    raise KeyError(f"컬럼 없음: {names}")
+        if n in df.columns:
+            return df[n].values
+    if required:
+        raise KeyError(f"컬럼 없음: {names}")
+    return default
 
 def _calc_ftemp(df, cfg_ft):
     k1, k2, k3 = cfg_ft["k1"], cfg_ft["k2"], cfg_ft["k3"]
     delta = cfg_ft["auto_delta"]
     win = int(np.round(cfg_ft["moving_avg_window_min"] * 60, 0))
+
+    need = [
+        ("응축기 공기 출구", ("Heatpump_DuctOutTemp", "T_Air_Cond_Out")),
+        ("증발기 공기 입구", ("Heatpump_DuctInTemp", "T_Air_Eva_In")),
+        ("증발기 냉매 입구", ("Heatpump_EvaInTemp", "T_Eva_In")),
+    ]
+    missing = [f"{lb}({'/'.join(ns)})" for lb, ns in need
+               if not any(n in df.columns for n in ns)]
+    if missing:
+        raise KeyError("컬럼: " + ", ".join(missing))
+
     raw = 10 * (k1 * _col(df, "Heatpump_DuctOutTemp", "T_Air_Cond_Out")
                 - k2 * _col(df, "Heatpump_DuctInTemp", "T_Air_Eva_In")
                 + k3 * _col(df, "Heatpump_EvaInTemp", "T_Eva_In")) + delta / 10
