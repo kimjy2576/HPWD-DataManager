@@ -170,7 +170,17 @@ def preprocess_ams(
 
     available = _fuzzy_col_match(df.columns, selected_columns)
     df = df[available].copy()
-    df["Time"] = df["Time"].astype(str).str.slice(0, 8)
+    # Time 정규화: "HH:MM:SS..." 형태일 때만 8자로 절단.
+    # 날짜가 포함된 형식("2024-01-01 10:00:00")을 8자로 자르면
+    # 모든 행이 "2024-01-"로 동일해져 drop_duplicates 후 1행만 남는 문제 발생.
+    t = df["Time"].astype(str).str.strip()
+    is_hms = t.str.match(r"^\d{1,2}:\d{2}:\d{2}")
+    ratio = float(is_hms.mean()) if len(t) else 0.0
+    if ratio >= 0.5:
+        df["Time"] = t.str.slice(0, 8)
+    else:
+        df["Time"] = t
+        print(f"  [ams] Time 형식이 HH:MM:SS 아님 — 원본 유지 (예: {t.iloc[0] if len(t) else ''})")
     return df
 
 

@@ -229,8 +229,23 @@ def filter_time_interval(df, interval):
 
 def filter_dry_cycle_br(df, filter_mode, min_hz, last_min, time_interval):
     F = filter_time_interval(df, time_interval)
+
+    # 필터에 필요한 컬럼이 없으면 필터링을 건너뛴다 (Merge 실패 방지)
+    need = ["HP_CompTargetHz", "HP_FanSpeed", "HP_EEV_Position"]
+    missing = [c for c in need if c not in F.columns]
+    if "HP_CompTargetHz" in missing or "Time_min" not in F.columns:
+        print(f"  [filter] 건조 구간 필터 건너뜀 — 컬럼 없음: {missing}")
+        return F
+
     cond_run = F["HP_CompTargetHz"] >= min_hz
-    cond_stop = (F["HP_CompTargetHz"] == 0) & (F["HP_FanSpeed"] == 0) & (F["HP_EEV_Position"] == 500)
+    if not missing:
+        cond_stop = ((F["HP_CompTargetHz"] == 0)
+                     & (F["HP_FanSpeed"] == 0)
+                     & (F["HP_EEV_Position"] == 500))
+    else:
+        # 보조 컬럼이 없으면 압축기 정지만으로 판정
+        print(f"  [filter] 정지 판정 축소 — 없는 컬럼: {missing}")
+        cond_stop = (F["HP_CompTargetHz"] == 0)
 
     end_min = F["Time_min"].iloc[-1]
     tail = F[F["Time_min"] >= (end_min - last_min)]
