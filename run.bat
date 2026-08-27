@@ -74,9 +74,59 @@ pause
 exit /b 1
 
 :NOPY
-echo [오류] Python이 설치되어 있지 않거나 PATH에 없습니다.
+echo [알림] Python이 설치되어 있지 않거나 PATH에 없습니다.
+echo.
+choice /c YN /n /m "Python 3.11 을 자동으로 설치할까요? (Y/N): "
+if errorlevel 2 goto NOPYMANUAL
+
+echo.
+echo   설치 파일 다운로드 중... (약 25MB)
+set "PYEXE=%TEMP%\python-3.11.9-amd64.exe"
+curl -L -o "%PYEXE%" https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
+if errorlevel 1 goto DLFAIL
+if not exist "%PYEXE%" goto DLFAIL
+
+echo   설치 중... (2~3분, 창이 잠시 멈춘 것처럼 보일 수 있음)
+"%PYEXE%" /passive InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_launcher=1
+del /q "%PYEXE%" >nul 2>&1
+
+rem 새로 추가된 PATH를 이 창에 반영
+for /f "skip=2 tokens=2,*" %%a in ('reg query "HKCU\Environment" /v PATH 2^>nul') do set "USERPATH=%%b"
+if defined USERPATH set "PATH=%USERPATH%;%PATH%"
+
+python --version >nul 2>&1
+if errorlevel 1 goto PYNEEDRESTART
+
+echo.
+echo   Python 설치 완료! 계속 진행합니다.
+echo.
+popd
+"%~f0"
+exit /b 0
+
+:PYNEEDRESTART
+echo.
+echo   Python 설치가 끝났습니다.
+echo   이 창을 닫고 run.bat 을 다시 실행해 주세요.
+popd
+pause
+exit /b 0
+
+:DLFAIL
+echo.
+echo [오류] 다운로드 실패 (네트워크 또는 사내 보안정책)
+echo   아래 주소에서 직접 받아 설치하세요:
 echo   https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
-echo   설치 시 "Add Python to PATH" 체크 필요
+echo   설치 시 "Add Python to PATH" 반드시 체크
+popd
+pause
+exit /b 1
+
+:NOPYMANUAL
+echo.
+echo   아래 주소에서 Python 3.11 을 설치하세요:
+echo   https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe
+echo   설치 시 "Add Python to PATH" 반드시 체크
 popd
 pause
 exit /b 1

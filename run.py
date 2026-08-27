@@ -28,13 +28,25 @@ REQUIRED = [
 
 
 def _pip(*args):
-    """pip 실행 — 실패 시 --user 로 재시도."""
+    """pip 실행 — 실패 시 --user, 사내망 SSL 우회 순으로 재시도."""
     import subprocess
-    cmd = [sys.executable, "-m", "pip", "install", *args]
-    if subprocess.run(cmd).returncode == 0:
-        return True
-    print("   → --user 옵션으로 재시도...")
-    return subprocess.run(cmd + ["--user"]).returncode == 0
+    base = [sys.executable, "-m", "pip", "install", *args]
+    trusted = ["--trusted-host", "pypi.org",
+               "--trusted-host", "files.pythonhosted.org",
+               "--trusted-host", "pypi.python.org"]
+
+    attempts = [
+        (base, None),
+        (base + ["--user"], "--user 옵션으로 재시도..."),
+        (base + trusted, "사내망 SSL 우회(trusted-host)로 재시도..."),
+        (base + trusted + ["--user"], "trusted-host + --user 로 재시도..."),
+    ]
+    for cmd, msg in attempts:
+        if msg:
+            print(f"   → {msg}")
+        if subprocess.run(cmd).returncode == 0:
+            return True
+    return False
 
 
 def ensure_deps():
