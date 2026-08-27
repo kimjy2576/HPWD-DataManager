@@ -280,13 +280,12 @@ def select_cases(req: SelectRequest):
 
 
 def _peek_header(path: Path, skip_rows: int = 1) -> str:
-    """CSV 헤더 행을 문자열로 반환 (인코딩 자동 시도). 실패 시 빈 문자열."""
+    """CSV 앞부분 여러 행을 합쳐 반환 (헤더 행 위치가 달라도 시그니처 탐지 가능)."""
     for enc in ("utf-8-sig", "utf-8", "cp949", "latin1"):
         try:
             with open(path, "r", encoding=enc, errors="strict") as f:
-                for _ in range(max(0, skip_rows)):
-                    f.readline()
-                return (f.readline() or "").lower()
+                lines = [f.readline() for _ in range(6)]
+            return "".join(l for l in lines if l).lower()
         except Exception:
             continue
     return ""
@@ -1052,16 +1051,76 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
     df_a, df_b, df_m, df_n = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     fr = file_rules or {}
     def _read_csv(path, src_key, default_skip=1):
-        """csv/tsv 읽기 — cp949/utf-8 자동 폴백"""
+        """csv/tsv 읽기 — 인코딩 폴백 + 헤더 행 자동 탐지."""
         sep = '\t' if path.lower().endswith('.tsv') else ','
-        skip = fr.get(src_key,{}).get("skip_rows", default_skip)
-        skiparg = list(range(skip)) if skip else None
-        for enc in ["utf-8", "cp949", "euc-kr", "latin1"]:
+        skip = fr.get(src_key, {}).get("skip_rows", default_skip)
+
+        # 인코딩 결정
+        enc_used = None
+        for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin1"]:
             try:
-                df = pd.read_csv(path, encoding=enc, sep=sep, skiprows=skiparg)
-                df.columns = [c.strip() for c in df.columns]
+                with open(path, "r", encoding=enc) as f:
+                    for _ in range(8):
+                        if not f.readline():
+                            break
+                enc_used = enc
+                break
+            except Exception:
+                continue
+        if enc_used is None:
+            enc_used = "latin1"
+
+        # 앞부분 행을 읽어 헤더 후보 점수화
+        try:
+            with open(path, "r", encoding=enc_used, errors="replace") as f:
+                head_lines = [f.readline().rstrip("\r\n") for _ in range(8)]
+        except Exception:
+            head_lines = []
+
+        def _score(line):
+            if not line:
+                return -1
+            cells = [c.strip().strip('"') for c in line.split(sep)]
+            cells = [c for c in cells if c != ""]
+            if len(cells) < 2:
+                return -1
+            def is_num(x):
+                try:
+                    float(x.replace(",", ""))
+                    return True
+                except Exception:
+                    return False
+            # 헤더다움: 값이 대부분 비숫자 + 컬럼 수가 많음
+            non_num = sum(1 for c in cells if not is_num(c))
+            uniq = len(set(cells))
+            return non_num * 2 + len(cells) + (uniq == len(cells)) * 3
+
+        best_skip = skip
+        if head_lines:
+            scores = {i: _score(l) for i, l in enumerate(head_lines)}
+            cand = max(scores, key=scores.get)
+            # 설정값이 명백히 나쁠 때만 교체
+            if scores.get(cand, -1) > scores.get(skip, -1) + 3:
+                best_skip = cand
+                print(f"  [read_csv] {os.path.basename(path)}: "
+                      f"헤더 행 자동 조정 skip_rows {skip} → {best_skip}")
+
+        skiparg = list(range(best_skip)) if best_skip else None
+        for enc in [enc_used, "utf-8", "cp949", "latin1"]:
+            try:
+                df = pd.read_csv(path, encoding=enc, sep=sep,
+                                 skiprows=skiparg, engine="python")
+                df.columns = [str(c).strip() for c in df.columns]
+                # Unnamed 컬럼이 절반 이상이면 헤더 탐지 실패로 보고 재시도
+                unnamed = sum(1 for c in df.columns if c.lower().startswith("unnamed"))
+                if len(df.columns) and unnamed > len(df.columns) / 2 and best_skip != skip:
+                    df = pd.read_csv(path, encoding=enc, sep=sep,
+                                     skiprows=list(range(skip)) if skip else None,
+                                     engine="python")
+                    df.columns = [str(c).strip() for c in df.columns]
                 return df
-            except: continue
+            except Exception:
+                continue
         return pd.DataFrame()
 
     def _read_excel(path):
