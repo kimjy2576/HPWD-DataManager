@@ -325,17 +325,26 @@ const scanVars=async()=>{if(!sid)return;setScanning(true);
         });
       }
       console.log('[scanVars] 매칭:',matchCount,'개');
-      // 매칭 0건이면 전부 include로 폴백
-      if(matchCount===0){
-        console.warn('[scanVars] 매칭 0건 — 전부 include로 설정');
-        csvCols.forEach(c=>{init[c].include=true});
-      }
     }
   }catch(e){
-    console.warn('[scanVars] 설정 로드 실패, 전부 include:',e);
-    csvCols.forEach(c=>{init[c].include=true})}
+    console.warn('[scanVars] 저장된 merge 설정 로드 실패:',e);
+  }
+  // config(column_mappings/selected_columns/scale_factors) 기반 기본 체크
+  //   저장된 설정에서 이미 매칭된 컬럼은 건드리지 않음
+  let cfgCount=0;
+  if(d.defaults){
+    Object.entries(d.defaults).forEach(([col,s])=>{
+      if(init[col]&&!init[col].include){init[col]={...init[col],...s};cfgCount++}
+    });
+    if(cfgCount)console.log('[scanVars] config 기본 체크:',cfgCount,'개');
+  }
+  // 그래도 하나도 없으면 전부 include로 폴백
+  if(matchCount===0&&cfgCount===0){
+    console.warn('[scanVars] 매칭 0건 — 전부 include로 설정');
+    csvCols.forEach(c=>{init[c].include=true});
+  }
   setVarSet(init);setVarOpen(true);
-  if(matchCount>0)console.log('[scanVars] 적용 완료:',matchCount,'개 체크됨');
+  console.log('[scanVars] 적용 완료: 저장설정',matchCount,'개 + config',cfgCount,'개');
   }catch(e){alert(e.message)}setScanning(false)};
 
 // 변수 설정 변경

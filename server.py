@@ -432,9 +432,41 @@ def scan_columns(req: BrowseRequest):
             except: pass
         break  # 첫 번째 케이스만
 
+    # ── config 기반 기본 선택값 (저장된 merge 설정이 없을 때의 폴백) ──
+    # column_mappings + selected_columns + scale_factors 를 조합해
+    # "원본 컬럼 → 표준명 + 가중치" 기본 체크 목록을 만든다.
+    defaults = {}
+    try:
+        cm = DEFAULT_CFG.get("column_mappings", {}) or {}
+        sc = DEFAULT_CFG.get("selected_columns", {}) or {}
+        scale_map = {
+            "ams": DEFAULT_CFG.get("ams_scale_factors", {}) or {},
+            "blackrose": {},
+        }
+        # config 키(ams/blackrose) → selected_columns 키(ams/br)
+        sel_key = {"ams": "ams", "blackrose": "br"}
+        for src, mapping in cm.items():
+            sel = set(sc.get(sel_key.get(src, src), []) or [])
+            sf = scale_map.get(src, {})
+            for raw_col, std_col in (mapping or {}).items():
+                if sel and std_col not in sel:
+                    continue
+                if raw_col not in all_columns:
+                    continue
+                defaults[raw_col] = {
+                    "include": True,
+                    "rename": std_col if std_col != raw_col else "",
+                    "weight": float(sf.get(std_col, 1.0)),
+                    "bias": 0.0,
+                }
+    except Exception as e:
+        print(f"  [scan] 기본 선택값 생성 실패: {e}")
+    print(f"  [scan] 컬럼 {len(all_columns)}개, config 기본 체크 {len(defaults)}개")
+
     return {
         "total": len(all_columns),
         "columns": all_columns,
+        "defaults": defaults,
     }
 
 
