@@ -48,6 +48,88 @@ STATIC = BASE_DIR / "static"
 RESULT_DIR = EXE_DIR / "results"
 RESULT_DIR.mkdir(exist_ok=True)
 
+
+def _save_csv_verified(df, path, sid=None, label=""):
+    """CSV 저장 후 실제 파일 존재/크기를 검증. 실패 시 로그 남기고 False."""
+    from pathlib import Path as _P
+    path = _P(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(path, index=False)
+    except Exception as e:
+        msg = f"  ❌ 저장 실패 [{label}] {path}: {type(e).__name__}: {e}"
+        print(msg)
+        if sid: _log(sid, msg)
+        return False
+    if not path.exists() or path.stat().st_size == 0:
+        msg = f"  ❌ 저장 후 파일 없음/0바이트 [{label}] {path}"
+        print(msg)
+        if sid: _log(sid, msg)
+        return False
+    return True
+
+
+def _copy_verified(src, dst, sid=None):
+    """원본 폴더 복사. 실패해도 진행하되 반드시 사유를 로그로 남긴다."""
+    import shutil
+    from pathlib import Path as _P
+    src, dst = _P(src), _P(dst)
+    try:
+        if not dst.parent.exists():
+            msg = f"  ⚠️ 원본 폴더 없음 — 복사 생략: {dst.parent}"
+            print(msg)
+            if sid: _log(sid, msg)
+            return False
+        shutil.copy2(str(src), str(dst))
+        if dst.exists() and dst.stat().st_size > 0:
+            if sid: _log(sid, f"  📁 원본 폴더 복사: {dst}")
+            return True
+        msg = f"  ⚠️ 복사 후 파일 확인 실패: {dst}"
+    except PermissionError as e:
+        msg = f"  ⚠️ 복사 권한 오류 (파일이 Excel 등에서 열려있는지 확인): {dst} — {e}"
+    except OSError as e:
+        msg = f"  ⚠️ 복사 실패 (경로 길이/네트워크 확인): {dst} — {type(e).__name__}: {e}"
+    except Exception as e:
+        msg = f"  ⚠️ 복사 실패: {dst} — {type(e).__name__}: {e}"
+    print(msg)
+    if sid: _log(sid, msg)
+    return False
+
+
+def _record_source(out_name, src_dir):
+    """결과 파일 → 원본 폴더 매핑을 _sources.json 에 기록."""
+    import json
+    meta = RESULT_DIR / "_sources.json"
+    data = {}
+    if meta.exists():
+        try:
+            data = json.loads(meta.read_text("utf-8"))
+        except Exception:
+            data = {}
+    data[out_name] = str(src_dir)
+    try:
+        meta.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+    except Exception as e:
+        print(f"  [sources] 기록 실패: {e}")
+
+
+def _lookup_source(out_name):
+    """_sources.json 에서 원본 폴더를 조회 (없으면 None)."""
+    import json
+    meta = RESULT_DIR / "_sources.json"
+    if not meta.exists():
+        return None
+    try:
+        data = json.loads(meta.read_text("utf-8"))
+    except Exception:
+        return None
+    for key in (out_name,
+                out_name.replace("_calc.csv", "_merged.csv"),
+                out_name.replace("_formula.csv", "_merged.csv")):
+        if key in data:
+            return Path(data[key])
+    return None
+
 sessions: dict[str, dict] = {}
 DEFAULT_CFG = load_config()
 
@@ -647,10 +729,16 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 prefix = "_".join(parts)
                 out_name = f"{prefix}_{i+1}_merged.csv"
                 result_path = RESULT_DIR / out_name
-                merged.to_csv(result_path, index=False)
-                import shutil
-                try: shutil.copy2(str(result_path), str(case_dir / out_name))
-                except: pass
+
+                if not _save_csv_verified(merged, result_path, sid, "결과 폴더"):
+                    raise IOError(f"결과 저장 실패: {result_path}")
+
+                # 원본(케이스) 폴더에도 복사 — 실패해도 진행하되 반드시 로그
+                _copy_verified(result_path, case_dir / out_name, sid)
+
+                # 출처 폴더 기록 (Calc 단계에서 원본 폴더를 찾는 데 사용)
+                _record_source(out_name, case_dir)
+
                 results.append(out_name)
                 _log(sid, f"  💾 저장: {time.perf_counter()-t1:.1f}s")
 
@@ -920,18 +1008,23 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
 
             # _calc.csv 저장
             out_name = fn.replace("_merged.csv", "_calc.csv")
-            df_calc.to_csv(RESULT_DIR / out_name, index=False)
+            calc_path = RESULT_DIR / out_name
+            if not _save_csv_verified(df_calc, calc_path, sid, "결과 폴더"):
+                raise IOError(f"결과 저장 실패: {calc_path}")
 
-            # 원본 폴더에도 저장
-            cat_path = s.get("category_path")
-            if cat_path:
-                for case_name in s.get("case_files", {}):
-                    if case_name.replace(" ", "_") in fn or fn.startswith(case_name[:10]):
-                        case_dir = Path(cat_path) / case_name
-                        if case_dir.exists():
-                            df_calc.to_csv(case_dir / out_name, index=False)
-                            _log(sid, f"  → {case_dir / out_name}")
-                        break
+            # 원본 폴더 결정: _sources.json 우선, 없으면 기존 휴리스틱
+            case_dir = _lookup_source(fn)
+            if case_dir is None:
+                cat_path = s.get("category_path")
+                if cat_path:
+                    for case_name in s.get("case_files", {}):
+                        if case_name.replace(" ", "_") in fn or fn.startswith(case_name[:10]):
+                            case_dir = Path(cat_path) / case_name
+                            break
+            if case_dir is not None:
+                _copy_verified(calc_path, Path(case_dir) / out_name, sid)
+            else:
+                _log(sid, f"  ⚠️ 원본 폴더를 찾지 못해 결과 폴더에만 저장: {out_name}")
 
             results.append(out_name)
             el = time.perf_counter() - t0
@@ -962,7 +1055,10 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
                             _log(sid, f"    ❌ {fm['name']}: {fe}")
                             n_failed += 1
                     # 항상 재저장 (formula 컬럼 포함)
-                    df_calc.to_csv(RESULT_DIR / out_name, index=False)
+                    if _save_csv_verified(df_calc, calc_path, sid, "결과 폴더(Formula)"):
+                        # 원본 폴더 사본도 formula 컬럼 포함본으로 갱신
+                        if case_dir is not None:
+                            _copy_verified(calc_path, Path(case_dir) / out_name, sid)
                     _log(sid, f"  🧪 결과: {n_applied}개 성공, {n_failed}개 실패, 총 {len(df_calc.columns)}열 저장")
             except Exception as fe:
                 _log(sid, f"  [Formula 경고] {fe}")
@@ -1638,6 +1734,35 @@ def _deep_merge_config(new_cfg, user_cfg):
         if key not in result:
             result[key] = user_val
     return result
+
+
+@app.get("/api/paths")
+def paths_info():
+    """실제 저장 경로와 파일 현황 — '파일이 어디 있냐' 진단용."""
+    import json
+    files = []
+    try:
+        for f in sorted(RESULT_DIR.glob("*.csv"), key=os.path.getmtime, reverse=True)[:50]:
+            files.append({"name": f.name, "size": f.stat().st_size,
+                          "mtime": f.stat().st_mtime})
+    except Exception:
+        pass
+    sources = {}
+    meta = RESULT_DIR / "_sources.json"
+    if meta.exists():
+        try:
+            sources = json.loads(meta.read_text("utf-8"))
+        except Exception:
+            pass
+    return {
+        "base_dir": str(BASE_DIR),
+        "result_dir": str(RESULT_DIR),
+        "result_dir_exists": RESULT_DIR.exists(),
+        "cwd": os.getcwd(),
+        "file_count": len(files),
+        "files": files,
+        "sources": sources,
+    }
 
 
 @app.get("/api/build")
