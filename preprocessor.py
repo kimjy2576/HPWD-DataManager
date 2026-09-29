@@ -156,25 +156,119 @@ def preprocess_ams(
         return pd.DataFrame({"Time": [0]})
 
     df = df_raw.copy()
+    raw_cols = set(map(str, df.columns))
     df.rename(columns=column_mapping, inplace=True)
-    # 한/중 전력 컬럼이 동시에 존재하면 rename 후 중복 발생 → 첫 번째만 유지
+    # 한/중 전력 컬럼 등 여러 원본이 같은 표준명으로 바뀌면 중복 → 첫 번째만 유지
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
+    diag = []
 
-    # 스케일 변환 — 벡터화
+    # 매핑된 수치 컬럼: 숫자화 + 0xFFFF(65535) 무효값 → NaN
+    mapped = list(dict.fromkeys(v for k, v in column_mapping.items()
+                                if k in raw_cols and v in df.columns))
+    n_sent = 0
+    for c in mapped:
+        if c in ("SubProcess", "Time"):
+            continue
+        v = pd.to_numeric(df[c], errors="coerce")
+        bad = v == 65535
+        if bad.any():
+            n_sent += int(bad.sum())
+            v = v.mask(bad)
+        df[c] = v
+    if n_sent:
+        diag.append(f"  [ams] 센서 무효값 65535 {n_sent}개 → 빈 값 처리")
+
+    # 스케일 변환
+    #   '[*10]', '[/100]' 표기가 있는 원본 컬럼은 로거가 배율을 명시한 것 → 설정 배율 적용
+    #   표기가 없는 로거 버전은 배율이 다를 수 있으므로 자동 판정
+    SUFFIXED = {"HP_CompTargetHz": "CompTargetHz[*10]",
+                "HP_FanSpeed": "FanSpeed[/100]",
+                "HP_SuperHeatDegree": "SuperHeatDegree[*10]"}
     for col, factor in scale_factors.items():
-        if col in df.columns:
-            df[col] = df[col] * factor
+        if col not in df.columns:
+            continue
+        tag = SUFFIXED.get(col)
+        if tag and tag not in raw_cols:
+            factor = _infer_ams_scale(df, col, factor, diag)
+            if factor == 1.0:
+                continue
+        df[col] = pd.to_numeric(df[col], errors="coerce") * factor
 
     if "SubProcess" in df.columns:
         df["SubProcess"] = df["SubProcess"].replace(subprocess_mapping)
 
     available = _fuzzy_col_match(df.columns, selected_columns)
     df = df[available].copy()
-    df["Time"] = normalize_ams_time(df["Time"])
+
+    # 진단: 주요 변수가 제자리에 들어왔는지 (0 제외 중앙값)
+    parts = []
+    for c in ["HP_CompCurrentHz", "HP_CompTargetHz", "Heatpump_DuctInTemp",
+              "Heatpump_DuctOutTemp", "Heatpump_EvaInTemp", "Heatpump_EvaOutTemp", "Po_WD"]:
+        if c not in df.columns:
+            parts.append(f"{c}=없음")
+            continue
+        v = pd.to_numeric(df[c], errors="coerce")
+        nz = v[(v != 0) & v.notna()]
+        parts.append(f"{c}={nz.median():.1f}" if len(nz) else f"{c}=전부0")
+    diag.append("  [ams] 주요 변수(0 제외 중앙값): " + ", ".join(parts))
+    if "SubProcess" in df.columns:
+        u = pd.Series(df["SubProcess"]).dropna().astype(str).unique()[:8]
+        diag.append(f"  [ams] SubProcess 값: {list(u)}")
+    df["Time"] = normalize_ams_time(df["Time"], diag)
+    for ln in diag:
+        print(ln)
+    df.attrs["ams_diag"] = diag
     return df
 
 
-def normalize_ams_time(s: pd.Series) -> pd.Series:
+def _infer_ams_scale(df, col, cfg_factor, diag):
+    """스케일 표기가 없는 AMS 컬럼의 배율 판정.
+
+    CompTargetHz: CompCurrentHz 와 운전 구간 비율로 판정 (≈10배면 ×10 저장)
+    그 외: 원값 사용 + 중앙값을 로그로 남겨 사용자가 확인
+    """
+    v = pd.to_numeric(df[col], errors="coerce")
+    if col == "HP_CompTargetHz" and "HP_CompCurrentHz" in df.columns:
+        cur = pd.to_numeric(df["HP_CompCurrentHz"], errors="coerce")
+        m = (v > 5) & (cur > 5)
+        if int(m.sum()) >= 30:
+            ratio = float((v[m] / cur[m]).median())
+            if 7 <= ratio <= 13:
+                diag.append(f"  [ams] {col}: 배율 표기 없음, CompCurrentHz 대비 {ratio:.1f}배 → ×{cfg_factor} 적용")
+                return cfg_factor
+            diag.append(f"  [ams] {col}: 배율 표기 없음, CompCurrentHz 대비 {ratio:.2f}배 → 원값 사용")
+            return 1.0
+    nz = v[(v != 0) & v.notna()]
+    med = f"{nz.median():.1f}" if len(nz) else "-"
+    diag.append(f"  [ams] {col}: 배율 표기 없음 → 원값 사용 (0 제외 중앙값 {med}, 설정 ×{cfg_factor} 미적용)")
+    return 1.0
+
+
+
+def _infer_ams_scale(df, col, cfg_factor, diag):
+    """스케일 표기가 없는 AMS 컬럼의 배율 판정.
+
+    CompTargetHz: CompCurrentHz 와 운전 구간 비율로 판정 (≈10배면 ×10 저장)
+    그 외: 원값 사용 + 중앙값을 로그로 남겨 사용자가 확인
+    """
+    v = pd.to_numeric(df[col], errors="coerce")
+    if col == "HP_CompTargetHz" and "HP_CompCurrentHz" in df.columns:
+        cur = pd.to_numeric(df["HP_CompCurrentHz"], errors="coerce")
+        m = (v > 5) & (cur > 5)
+        if int(m.sum()) >= 30:
+            ratio = float((v[m] / cur[m]).median())
+            if 7 <= ratio <= 13:
+                diag.append(f"  [ams] {col}: 배율 표기 없음, CompCurrentHz 대비 {ratio:.1f}배 → ×{cfg_factor} 적용")
+                return cfg_factor
+            diag.append(f"  [ams] {col}: 배율 표기 없음, CompCurrentHz 대비 {ratio:.2f}배 → 원값 사용")
+            return 1.0
+    nz = v[(v != 0) & v.notna()]
+    med = f"{nz.median():.1f}" if len(nz) else "-"
+    diag.append(f"  [ams] {col}: 배율 표기 없음 → 원값 사용 (0 제외 중앙값 {med}, 설정 ×{cfg_factor} 미적용)")
+    return 1.0
+
+
+def normalize_ams_time(s: pd.Series, diag: list | None = None) -> pd.Series:
     """AMS Time 열을 'HH:MM:SS' 문자열로 정규화.
 
     지원 형식 (다수결로 판별):

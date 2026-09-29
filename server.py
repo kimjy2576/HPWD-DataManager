@@ -49,6 +49,67 @@ RESULT_DIR = EXE_DIR / "results"
 RESULT_DIR.mkdir(exist_ok=True)
 
 
+_READ_NOTES = []   # _read_csv 진단 메시지 버퍼 → _run_merge 가 UI 로그로 출력
+
+
+def _csv_layout(path, enc, sep, header_row, sample=300):
+    """헤더 칸 수와 데이터 칸 수를 비교해 올바른 컬럼 이름 배열을 만든다.
+
+    AMS 로거는 헤더 이름 안의 쉼표(예: '건조 외기 감지 값(상온, 저온, 고온)')를
+    데이터에서는 별도 칸으로 기록해, 데이터가 헤더보다 (쉼표 수)만큼 넓어진다.
+    이 경우 pandas 기본 동작은 초과분만큼 '앞쪽 칸을 인덱스로' 빼버려
+    Time 을 포함한 모든 컬럼이 밀린다 (Time 자리에 Packet Index 가 들어감).
+    """
+    import csv, itertools
+    from collections import Counter
+    try:
+        with open(path, "r", encoding=enc, errors="replace", newline="") as f:
+            rows = list(itertools.islice(csv.reader(f, delimiter=sep),
+                                         header_row + 1 + sample))
+    except Exception:
+        return None
+    if len(rows) <= header_row:
+        return None
+    header = [c.strip() for c in rows[header_row]]
+    while header and header[-1] == "":
+        header.pop()
+    N = len(header)
+    data = [r for r in rows[header_row + 1:] if any(x.strip() for x in r)]
+    if not data:
+        return {"names": header, "N": N, "M": N, "mode": "ok", "note": ""}
+    M = Counter(len(r) for r in data).most_common(1)[0][0]
+    if M <= N:
+        note = "" if M == N else f"데이터 {M}칸 < 헤더 {N}칸 (부족분은 빈 값)"
+        return {"names": header, "N": N, "M": M, "mode": "ok", "note": note}
+    extra = M - N
+    commas = sum(h.count(",") for h in header) if sep == "," else 0
+    if commas == extra:
+        names = []
+        for h in header:
+            names.append(h)
+            names += [f"{h}#{j + 2}" for j in range(h.count(","))]
+        split = [h for h in header if "," in h]
+        return {"names": names, "N": N, "M": M, "mode": "comma_split",
+                "note": f"헤더 {N}칸 / 데이터 {M}칸 → 쉼표 포함 헤더 {len(split)}개가 "
+                        f"데이터에서 분할됨, 정렬 보정: {split}"}
+    names = header + [f"_extra_{i + 1}" for i in range(extra)]
+    return {"names": names, "N": N, "M": M, "mode": "pad",
+            "note": f"⚠️ 헤더 {N}칸 / 데이터 {M}칸 — 초과 {extra}칸 원인 불명, "
+                    f"뒤쪽에 임시 이름 부여 (뒤쪽 컬럼 값 확인 필요)"}
+
+
+def _dedupe_names(names):
+    seen, out = {}, []
+    for n in names:
+        if n in seen:
+            seen[n] += 1
+            out.append(f"{n}.{seen[n]}")
+        else:
+            seen[n] = 0
+            out.append(n)
+    return out
+
+
 def _save_csv_verified(df, path, sid=None, label=""):
     """CSV 저장 후 실제 파일 존재/크기를 검증. 실패 시 로그 남기고 False."""
     from pathlib import Path as _P
@@ -535,10 +596,15 @@ def scan_columns(req: BrowseRequest):
                     continue
                 if raw_col not in all_columns:
                     continue
+                # 배율 표기('[*10]','[/100]')가 없는 변형 컬럼은 전처리가 자동 판정하므로 1.0 표시
+                _w = float(sf.get(std_col, 1.0))
+                if std_col in ("HP_CompTargetHz", "HP_FanSpeed", "HP_SuperHeatDegree") \
+                        and "[" not in raw_col:
+                    _w = 1.0
                 defaults[raw_col] = {
                     "include": True,
                     "rename": std_col if std_col != raw_col else "",
-                    "weight": float(sf.get(std_col, 1.0)),
+                    "weight": _w,
                     "bias": 0.0,
                 }
     except Exception as e:
@@ -625,6 +691,8 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
 
                 t1 = time.perf_counter()
                 df_ams, df_br, df_mx, df_ni = _read(ap, bp, mp_list, dt, np_list=np_list, file_rules=cfg.get("file_rules"))
+                while _READ_NOTES:
+                    _log(sid, _READ_NOTES.pop(0))
                 _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={len(df_ni)}행/{len(cf.get('nidaq',[]))}파일)")
 
                 t1 = time.perf_counter()
@@ -642,6 +710,8 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                         get_selected_columns(cfg, "ams"))
                 else:
                     df_ams_proc = pd.DataFrame()
+                for _ln in df_ams_proc.attrs.get("ams_diag", []) if not df_ams_proc.empty else []:
+                    _log(sid, _ln)
 
                 if use_mx and not df_mx.empty:
                     df_mx_proc = preprocess_mx100(df_mx, cfg["mx100"]["useless_columns"])
@@ -1230,29 +1300,38 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
             # 설정값이 명백히 나쁠 때만 교체
             if scores.get(cand, -1) > scores.get(skip, -1) + 3:
                 best_skip = cand
-                print(f"  [read_csv] {os.path.basename(path)}: "
+                _m = (f"  [read_csv] {os.path.basename(path)}: "
                       f"헤더 행 자동 조정 skip_rows {skip} → {best_skip}")
+                print(_m); _READ_NOTES.append(_m)
 
         skiparg = list(range(best_skip)) if best_skip else None
-        def _rc(enc, sk):
-            # C 엔진 우선 (python 엔진은 대용량에서 수십 배 느림) → 실패 시에만 python
-            kw = dict(encoding=enc, sep=sep, skiprows=list(range(sk)) if sk else None)
+        def _read_with_layout(enc, sk):
+            lay = _csv_layout(path, enc, sep, sk)
+            if lay is None:
+                return None
+            names = _dedupe_names(lay["names"])
+            if lay["note"]:
+                msg = f"  [read_csv] {os.path.basename(path)}: {lay['note']}"
+                print(msg); _READ_NOTES.append(msg)
+            kw = dict(encoding=enc, sep=sep, header=None, names=names,
+                      skiprows=sk + 1, index_col=False, encoding_errors="replace")
             try:
                 return pd.read_csv(path, low_memory=False, **kw)
             except Exception:
-                return pd.read_csv(path, engine="python", **kw)
+                # 일부 행만 폭이 다르면 python 엔진으로 초과분을 잘라서 읽음
+                return pd.read_csv(path, engine="python",
+                                   on_bad_lines=lambda row: row[:len(names)], **kw)
 
         for enc in [enc_used, "utf-8", "cp949", "latin1"]:
             try:
-                df = _rc(enc, best_skip)
+                df = _read_with_layout(enc, best_skip)
+                if df is None:
+                    continue
                 df.columns = [str(c).strip() for c in df.columns]
-                # Unnamed 컬럼이 절반 이상이면 헤더 탐지 실패로 보고 재시도
-                unnamed = sum(1 for c in df.columns if c.lower().startswith("unnamed"))
-                if len(df.columns) and unnamed > len(df.columns) / 2 and best_skip != skip:
-                    df = _rc(enc, skip)
-                    df.columns = [str(c).strip() for c in df.columns]
                 return df
-            except Exception:
+            except Exception as e:
+                msg = f"  [read_csv] {os.path.basename(path)} ({enc}) 읽기 실패: {type(e).__name__}: {e}"
+                print(msg); _READ_NOTES.append(msg)
                 continue
         return pd.DataFrame()
 
