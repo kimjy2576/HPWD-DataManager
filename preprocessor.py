@@ -244,30 +244,6 @@ def _infer_ams_scale(df, col, cfg_factor, diag):
     return 1.0
 
 
-
-def _infer_ams_scale(df, col, cfg_factor, diag):
-    """스케일 표기가 없는 AMS 컬럼의 배율 판정.
-
-    CompTargetHz: CompCurrentHz 와 운전 구간 비율로 판정 (≈10배면 ×10 저장)
-    그 외: 원값 사용 + 중앙값을 로그로 남겨 사용자가 확인
-    """
-    v = pd.to_numeric(df[col], errors="coerce")
-    if col == "HP_CompTargetHz" and "HP_CompCurrentHz" in df.columns:
-        cur = pd.to_numeric(df["HP_CompCurrentHz"], errors="coerce")
-        m = (v > 5) & (cur > 5)
-        if int(m.sum()) >= 30:
-            ratio = float((v[m] / cur[m]).median())
-            if 7 <= ratio <= 13:
-                diag.append(f"  [ams] {col}: 배율 표기 없음, CompCurrentHz 대비 {ratio:.1f}배 → ×{cfg_factor} 적용")
-                return cfg_factor
-            diag.append(f"  [ams] {col}: 배율 표기 없음, CompCurrentHz 대비 {ratio:.2f}배 → 원값 사용")
-            return 1.0
-    nz = v[(v != 0) & v.notna()]
-    med = f"{nz.median():.1f}" if len(nz) else "-"
-    diag.append(f"  [ams] {col}: 배율 표기 없음 → 원값 사용 (0 제외 중앙값 {med}, 설정 ×{cfg_factor} 미적용)")
-    return 1.0
-
-
 def normalize_ams_time(s: pd.Series, diag: list | None = None) -> pd.Series:
     """AMS Time 열을 'HH:MM:SS' 문자열로 정규화.
 
