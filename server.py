@@ -110,6 +110,97 @@ def _dedupe_names(names):
     return out
 
 
+def read_source_csv(path, file_rules, src_key, default_skip=1):
+    """csv/tsv 읽기 — 인코딩 폴백 + 헤더 행 자동 탐지 + 레이아웃 보정.
+
+    앱(Merge)과 진단 도구(tools/diagnose.py)가 같은 경로를 쓰도록 모듈 수준에 둠.
+    """
+    sep = '\t' if path.lower().endswith('.tsv') else ','
+    skip = (file_rules or {}).get(src_key, {}).get("skip_rows", default_skip)
+
+    # 인코딩 결정
+    enc_used = None
+    for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin1"]:
+        try:
+            with open(path, "r", encoding=enc) as f:
+                for _ in range(8):
+                    if not f.readline():
+                        break
+            enc_used = enc
+            break
+        except Exception:
+            continue
+    if enc_used is None:
+        enc_used = "latin1"
+
+    # 앞부분 행을 읽어 헤더 후보 점수화
+    try:
+        with open(path, "r", encoding=enc_used, errors="replace") as f:
+            head_lines = [f.readline().rstrip("\r\n") for _ in range(8)]
+    except Exception:
+        head_lines = []
+
+    def _score(line):
+        if not line:
+            return -1
+        cells = [c.strip().strip('"') for c in line.split(sep)]
+        cells = [c for c in cells if c != ""]
+        if len(cells) < 2:
+            return -1
+        def is_num(x):
+            try:
+                float(x.replace(",", ""))
+                return True
+            except Exception:
+                return False
+        # 헤더다움: 값이 대부분 비숫자 + 컬럼 수가 많음
+        non_num = sum(1 for c in cells if not is_num(c))
+        uniq = len(set(cells))
+        return non_num * 2 + len(cells) + (uniq == len(cells)) * 3
+
+    best_skip = skip
+    if head_lines:
+        scores = {i: _score(l) for i, l in enumerate(head_lines)}
+        cand = max(scores, key=scores.get)
+        # 설정값이 명백히 나쁠 때만 교체
+        if scores.get(cand, -1) > scores.get(skip, -1) + 3:
+            best_skip = cand
+            _m = (f"  [read_csv] {os.path.basename(path)}: "
+                  f"헤더 행 자동 조정 skip_rows {skip} → {best_skip}")
+            print(_m); _READ_NOTES.append(_m)
+
+    skiparg = list(range(best_skip)) if best_skip else None
+    def _read_with_layout(enc, sk):
+        lay = _csv_layout(path, enc, sep, sk)
+        if lay is None:
+            return None
+        names = _dedupe_names(lay["names"])
+        if lay["note"]:
+            msg = f"  [read_csv] {os.path.basename(path)}: {lay['note']}"
+            print(msg); _READ_NOTES.append(msg)
+        kw = dict(encoding=enc, sep=sep, header=None, names=names,
+                  skiprows=sk + 1, index_col=False, encoding_errors="replace")
+        try:
+            return pd.read_csv(path, low_memory=False, **kw)
+        except Exception:
+            # 일부 행만 폭이 다르면 python 엔진으로 초과분을 잘라서 읽음
+            return pd.read_csv(path, engine="python",
+                               on_bad_lines=lambda row: row[:len(names)], **kw)
+
+    for enc in [enc_used, "utf-8", "cp949", "latin1"]:
+        try:
+            df = _read_with_layout(enc, best_skip)
+            if df is None:
+                continue
+            df.columns = [str(c).strip() for c in df.columns]
+            return df
+        except Exception as e:
+            msg = f"  [read_csv] {os.path.basename(path)} ({enc}) 읽기 실패: {type(e).__name__}: {e}"
+            print(msg); _READ_NOTES.append(msg)
+            continue
+    return pd.DataFrame()
+
+
 def _save_csv_verified(df, path, sid=None, label=""):
     """CSV 저장 후 실제 파일 존재/크기를 검증. 실패 시 로그 남기고 False."""
     from pathlib import Path as _P
@@ -1249,91 +1340,7 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
     df_a, df_b, df_m, df_n = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     fr = file_rules or {}
     def _read_csv(path, src_key, default_skip=1):
-        """csv/tsv 읽기 — 인코딩 폴백 + 헤더 행 자동 탐지."""
-        sep = '\t' if path.lower().endswith('.tsv') else ','
-        skip = fr.get(src_key, {}).get("skip_rows", default_skip)
-
-        # 인코딩 결정
-        enc_used = None
-        for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin1"]:
-            try:
-                with open(path, "r", encoding=enc) as f:
-                    for _ in range(8):
-                        if not f.readline():
-                            break
-                enc_used = enc
-                break
-            except Exception:
-                continue
-        if enc_used is None:
-            enc_used = "latin1"
-
-        # 앞부분 행을 읽어 헤더 후보 점수화
-        try:
-            with open(path, "r", encoding=enc_used, errors="replace") as f:
-                head_lines = [f.readline().rstrip("\r\n") for _ in range(8)]
-        except Exception:
-            head_lines = []
-
-        def _score(line):
-            if not line:
-                return -1
-            cells = [c.strip().strip('"') for c in line.split(sep)]
-            cells = [c for c in cells if c != ""]
-            if len(cells) < 2:
-                return -1
-            def is_num(x):
-                try:
-                    float(x.replace(",", ""))
-                    return True
-                except Exception:
-                    return False
-            # 헤더다움: 값이 대부분 비숫자 + 컬럼 수가 많음
-            non_num = sum(1 for c in cells if not is_num(c))
-            uniq = len(set(cells))
-            return non_num * 2 + len(cells) + (uniq == len(cells)) * 3
-
-        best_skip = skip
-        if head_lines:
-            scores = {i: _score(l) for i, l in enumerate(head_lines)}
-            cand = max(scores, key=scores.get)
-            # 설정값이 명백히 나쁠 때만 교체
-            if scores.get(cand, -1) > scores.get(skip, -1) + 3:
-                best_skip = cand
-                _m = (f"  [read_csv] {os.path.basename(path)}: "
-                      f"헤더 행 자동 조정 skip_rows {skip} → {best_skip}")
-                print(_m); _READ_NOTES.append(_m)
-
-        skiparg = list(range(best_skip)) if best_skip else None
-        def _read_with_layout(enc, sk):
-            lay = _csv_layout(path, enc, sep, sk)
-            if lay is None:
-                return None
-            names = _dedupe_names(lay["names"])
-            if lay["note"]:
-                msg = f"  [read_csv] {os.path.basename(path)}: {lay['note']}"
-                print(msg); _READ_NOTES.append(msg)
-            kw = dict(encoding=enc, sep=sep, header=None, names=names,
-                      skiprows=sk + 1, index_col=False, encoding_errors="replace")
-            try:
-                return pd.read_csv(path, low_memory=False, **kw)
-            except Exception:
-                # 일부 행만 폭이 다르면 python 엔진으로 초과분을 잘라서 읽음
-                return pd.read_csv(path, engine="python",
-                                   on_bad_lines=lambda row: row[:len(names)], **kw)
-
-        for enc in [enc_used, "utf-8", "cp949", "latin1"]:
-            try:
-                df = _read_with_layout(enc, best_skip)
-                if df is None:
-                    continue
-                df.columns = [str(c).strip() for c in df.columns]
-                return df
-            except Exception as e:
-                msg = f"  [read_csv] {os.path.basename(path)} ({enc}) 읽기 실패: {type(e).__name__}: {e}"
-                print(msg); _READ_NOTES.append(msg)
-                continue
-        return pd.DataFrame()
+        return read_source_csv(path, fr, src_key, default_skip)
 
     def _read_excel(path):
         skip = fr.get("mx100",{}).get("skip_rows",24)
