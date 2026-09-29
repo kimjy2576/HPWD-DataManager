@@ -1234,17 +1234,22 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
                       f"헤더 행 자동 조정 skip_rows {skip} → {best_skip}")
 
         skiparg = list(range(best_skip)) if best_skip else None
+        def _rc(enc, sk):
+            # C 엔진 우선 (python 엔진은 대용량에서 수십 배 느림) → 실패 시에만 python
+            kw = dict(encoding=enc, sep=sep, skiprows=list(range(sk)) if sk else None)
+            try:
+                return pd.read_csv(path, low_memory=False, **kw)
+            except Exception:
+                return pd.read_csv(path, engine="python", **kw)
+
         for enc in [enc_used, "utf-8", "cp949", "latin1"]:
             try:
-                df = pd.read_csv(path, encoding=enc, sep=sep,
-                                 skiprows=skiparg, engine="python")
+                df = _rc(enc, best_skip)
                 df.columns = [str(c).strip() for c in df.columns]
                 # Unnamed 컬럼이 절반 이상이면 헤더 탐지 실패로 보고 재시도
                 unnamed = sum(1 for c in df.columns if c.lower().startswith("unnamed"))
                 if len(df.columns) and unnamed > len(df.columns) / 2 and best_skip != skip:
-                    df = pd.read_csv(path, encoding=enc, sep=sep,
-                                     skiprows=list(range(skip)) if skip else None,
-                                     engine="python")
+                    df = _rc(enc, skip)
                     df.columns = [str(c).strip() for c in df.columns]
                 return df
             except Exception:

@@ -170,18 +170,84 @@ def preprocess_ams(
 
     available = _fuzzy_col_match(df.columns, selected_columns)
     df = df[available].copy()
-    # Time 정규화: "HH:MM:SS..." 형태일 때만 8자로 절단.
-    # 날짜가 포함된 형식("2024-01-01 10:00:00")을 8자로 자르면
-    # 모든 행이 "2024-01-"로 동일해져 drop_duplicates 후 1행만 남는 문제 발생.
-    t = df["Time"].astype(str).str.strip()
-    is_hms = t.str.match(r"^\d{1,2}:\d{2}:\d{2}")
-    ratio = float(is_hms.mean()) if len(t) else 0.0
-    if ratio >= 0.5:
-        df["Time"] = t.str.slice(0, 8)
-    else:
-        df["Time"] = t
-        print(f"  [ams] Time 형식이 HH:MM:SS 아님 — 원본 유지 (예: {t.iloc[0] if len(t) else ''})")
+    df["Time"] = normalize_ams_time(df["Time"])
     return df
+
+
+def normalize_ams_time(s: pd.Series) -> pd.Series:
+    """AMS Time 열을 'HH:MM:SS' 문자열로 정규화.
+
+    지원 형식 (다수결로 판별):
+      - 날짜 포함  '2024-01-01 10:00:00'  → 원본 유지 (to_datetime 이 처리)
+      - HH:MM:SS(.f)  '10:23:45.123'      → 'HH:MM:SS'
+      - MM:SS(.f)     '01:30.5'           → 경과시간 → 'HH:MM:SS'
+          ※ pandas 는 이 형식을 '시:분'으로 오해석함
+            ('00:01.0' → 1분, '59:59.9' → NaT) → 반드시 직접 환산
+          ※ Excel 에서 열었다 저장하면 시(hour) 자리가 사라져
+            60분마다 00:00.0 으로 되돌아감 → 롤오버 보정
+      - 숫자(경과초)  '90.5'               → 'HH:MM:SS'
+    소수점 이하 초는 버림 (이후 1초 격자로 리샘플되므로 영향 없음)
+    """
+    t = s.astype(str).str.strip()
+    if len(t) == 0:
+        return t
+
+    def _to_hms(sec: pd.Series) -> pd.Series:
+        sec = pd.to_numeric(sec, errors="coerce")
+        whole = np.floor(sec)
+        ok = whole.notna()
+        out = pd.Series(np.nan, index=sec.index, dtype=object)
+        w = whole[ok].astype("int64")
+        out[ok] = ((w // 3600).astype(str).str.zfill(2) + ":"
+                   + ((w % 3600) // 60).astype(str).str.zfill(2) + ":"
+                   + (w % 60).astype(str).str.zfill(2))
+        return out
+
+    def _unroll(sec: pd.Series, period: float) -> pd.Series:
+        """값이 period 의 절반 이상 급감하면 롤오버로 보고 period 를 누적 가산."""
+        d = sec.diff()
+        jumps = (d < -period / 2).cumsum()
+        n = int(jumps.iloc[-1]) if len(jumps) and pd.notna(jumps.iloc[-1]) else 0
+        if n:
+            print(f"  [ams] Time 롤오버 {n}회 보정 (주기 {period/60:.0f}분)")
+        return sec + jumps * period
+
+    # 1) 날짜 포함 — 행마다 소수점 유무가 달라도 파싱되도록 format="mixed"
+    #    (pandas 2 는 첫 행 형식으로 고정 추론 → 나머지 NaT 발생)
+    if t.str.contains(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}", regex=True).mean() >= 0.5:
+        try:
+            dt = pd.to_datetime(t, errors="coerce", format="mixed")
+        except (TypeError, ValueError):
+            dt = pd.to_datetime(t, errors="coerce")
+        out = dt.dt.strftime("%Y-%m-%d %H:%M:%S")
+        return out.where(dt.notna(), t)
+
+    colons = t.str.count(":")
+    mode = int(colons.mode().iloc[0]) if len(colons) else 0
+
+    # 2) HH:MM:SS(.f)
+    if mode >= 2:
+        return t.str.slice(0, 8)
+
+    # 3) MM:SS(.f) — 시 자리 없는 경과시간
+    if mode == 1:
+        p = t.str.extract(r"^\s*(\d+):(\d+(?:\.\d+)?)\s*$")
+        sec = pd.to_numeric(p[0], errors="coerce") * 60 + pd.to_numeric(p[1], errors="coerce")
+        # 분이 60 이상으로 계속 커지는 로거는 롤오버가 없으므로 그대로 둠
+        if pd.to_numeric(p[0], errors="coerce").max() < 60:
+            sec = _unroll(sec, 3600.0)
+        print(f"  [ams] Time 형식 MM:SS.f 감지 → 경과시간으로 환산 "
+              f"(예: '{t.iloc[0]}' ... '{t.iloc[-1]}', 총 {sec.max()/60:.1f}분)")
+        return _to_hms(sec)
+
+    # 4) 숫자 경과초
+    num = pd.to_numeric(t, errors="coerce")
+    if num.notna().mean() >= 0.5:
+        print("  [ams] Time 이 숫자 — 경과초로 환산")
+        return _to_hms(num)
+
+    print(f"  [ams] Time 형식 판별 불가 — 원본 유지 (예: {t.iloc[0]})")
+    return t
 
 
 # ══════════════════════════════════════════════
