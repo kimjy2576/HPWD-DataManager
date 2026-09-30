@@ -1510,8 +1510,14 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
 
   // 탭 = 카테고리 (생성/삭제 가능)
   const initTabs=()=>{
-    const cats=mode==='merge'?vwAutoCats(allVars):VW_CATS;
-    const ts=cats.map((c,i)=>{
+    if(mode==='merge'){
+      // Merge 파일은 Calc 용 카테고리 형식을 쓰지 않고 전체 변수를 한 탭에 표시
+      // (온도→압력→압축기·팬→전력→기타 순으로 모아서 비슷한 그래프끼리 붙여 둠)
+      const all=vwAutoCats(allVars).flatMap(c=>c.vars);
+      const cols=all.length<=2?Math.max(1,all.length):(all.length<=4?2:3);
+      return[{id:0,name:'전체 변수',rows:Math.max(1,Math.ceil(all.length/cols)),cols,plots:all}];
+    }
+    const ts=VW_CATS.map((c,i)=>{
       const av=c.vars.filter(k=>cases.some(cs=>cs?.data?.[k]));
       const r=c.rows||3,cl=c.cols||3;
       return{id:i,name:c.name,rows:r,cols:cl,plots:av.slice(0,r*cl)}
@@ -1581,7 +1587,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       const actR=Math.max(1,Math.min(tab.rows,Math.ceil(nPlots.length/tab.cols)));
       const actC=Math.max(1,Math.min(tab.cols,nPlots.length));
       const tr=[];const shapes=[];
-      const totalH=Math.max(actR*120,chartH); // chartH가 총 높이, 행당 최소 120px
+      const totalH=mode==='merge'?Math.round(actR*Math.max(180,chartH/3)):Math.max(actR*120,chartH); // 표준: chartH=총 높이 / 원본: 행당 chartH÷3
 
       const fontMap={sans:'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif',mono:'ui-monospace,"SF Mono",Consolas,monospace',serif:'Georgia,"Times New Roman",serif'};
       const fontFamily=fontMap[tab.fontFamily||'sans'];
@@ -1595,7 +1601,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       const legendFont={size:legendSize,family:fontFamily};
       // HTML 태그 기반 fallback (weight 미지원 버전 대응)
       const wrapB=(s)=>tBold?`<b>${s}</b>`:s;
-      const yTitleClean=k=>lab(k);  // 모드별 표시 이름 (<b> 래핑 없이 font.weight로 굵기 처리)
+      const yTitleClean=k=>VL[k]||k;  // 축 제목은 짧게 (원본 모드의 '원본명 · 의미' 표기는 드롭다운에서만)
       const lo={grid:{rows:actR,columns:actC,pattern:'independent',xgap:xGap,ygap:yGap},height:totalH,width:finalW,margin:{t:30,b:50,l:80,r:30},paper_bgcolor:'rgba(255,255,255,0)',plot_bgcolor:'#ffffff',font:{family:fontFamily,color:'#3a3a4e',size:tickSize},showlegend:true,legend:{orientation:'h',y:1.06,x:.5,xanchor:'center',font:legendFont},hovermode:'x unified',dragmode:dragMode==='pan'?'pan':'zoom',shapes};
       const yRangeFor=k=>{
         const yr=tab.yranges?.[k];
@@ -1686,9 +1692,11 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
         <span style={{color:'var(--tx3)',fontSize:10,minWidth:20}}>행</span>
         <select value={tab.rows} onChange={e=>{const r=+e.target.value;const need=r*tab.cols;
           if(tab.plots.length<need){const rest=allVars.filter(k=>!tab.plots.includes(k));updateTab({rows:r,plots:[...tab.plots,...rest.slice(0,need-tab.plots.length)]})}else{updateTab({rows:r})}
-        }} style={{width:42,fontSize:11,padding:'2px 4px'}}>{[1,2,3,4].map(n=><option key={n} value={n}>{n}</option>)}</select>
+        }} style={{width:42,fontSize:11,padding:'2px 4px'}}>{Array.from({length:Math.max(4,tab.rows,Math.ceil(allVars.length/Math.max(1,tab.cols)))},(_,i)=>i+1).map(n=><option key={n} value={n}>{n}</option>)}</select>
         <span style={{color:'var(--tx3)',fontSize:10,minWidth:20}}>열</span>
-        <select value={tab.cols} onChange={e=>{const c=+e.target.value;const need=tab.rows*c;
+        <select value={tab.cols} onChange={e=>{const c=+e.target.value;
+          if(mode==='merge'){updateTab({cols:c,rows:Math.max(1,Math.ceil(tab.plots.length/c))});return}
+          const need=tab.rows*c;
           if(tab.plots.length<need){const rest=allVars.filter(k=>!tab.plots.includes(k));updateTab({cols:c,plots:[...tab.plots,...rest.slice(0,need-tab.plots.length)]})}else{updateTab({cols:c})}
         }} style={{width:42,fontSize:11,padding:'2px 4px'}}>{[1,2,3,4].map(n=><option key={n} value={n}>{n}</option>)}</select>
         <span style={{fontSize:9,color:'var(--tx3)',fontFamily:'var(--mono)',marginLeft:4}}>{tab.rows}×{tab.cols}</span>
