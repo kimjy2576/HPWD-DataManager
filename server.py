@@ -814,6 +814,19 @@ def scan_columns(req: BrowseRequest):
                 }
     except Exception as e:
         print(f"  [scan] 기본 선택값 생성 실패: {e}")
+    # 이름을 바꾸지 않는 선택 변수(Time, 원본명이 곧 표준명인 변수)도 기본 체크.
+    # 위 루프는 이름 변경 매핑만 돌기 때문에 매핑에 없는 이런 변수가 빠져 있었음.
+    try:
+        for cols in (sc or {}).values():
+            for std in (cols or []):
+                if std in all_columns and std not in defaults:
+                    defaults[std] = {"include": True, "rename": "", "weight": 1.0, "bias": 0.0}
+    except Exception as e:
+        print(f"  [scan] 선택 변수 기본 체크 실패: {e}")
+    # 시간 컬럼은 병합 시 항상 유지되므로(_apply_variable_settings 보호 목록) 화면에서도 체크
+    for t in ("Time", "Time_sec", "Time_min"):
+        if t in all_columns:
+            defaults[t] = {"include": True, "rename": "", "weight": 1.0, "bias": 0.0}
     print(f"  [scan] 컬럼 {len(all_columns)}개, config 기본 체크 {len(defaults)}개")
 
     return {
