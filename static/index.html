@@ -1032,6 +1032,28 @@ const VW_CATS=[
   {name:'건조성능',rows:3,cols:3,vars:['Water_calc_kg','Water_calc_kg_raw','RMC_calc','RMC_calc_raw','Factor_SFH','Factor_SFH_raw','Factor_LFH','Factor_LFH_raw','SMER']},
 ];
 
+// ── 원본(Merge) 모드 ─────────────────────────────────────────────
+// Calc 없이 Merge 파일을 볼 때는 우리 표준명과 변수명이 다를 수 있으므로,
+// 파일에 실제로 있는 컬럼을 종류별로 자동 분류해 카테고리를 만든다.
+const VW_ALIAS_SRC={T_Air_Eva_In:'Heatpump_DuctInTemp',T_Air_Cond_Out:'Heatpump_DuctOutTemp',T_Eva_In:'Heatpump_EvaInTemp',T_Eva_Out:'Heatpump_EvaOutTemp',T_Comp_Body:'Heatpump_CompTemp'};
+const VW_ALIAS_OF=Object.fromEntries(Object.entries(VW_ALIAS_SRC).map(([a,b])=>[b,a]));
+const VW_CALC_SIG=['Flow_ref_kgH','Qrefr_Cond','Qrefr_Eva','COP','SMER','Water_calc_kg','RMC_calc'];
+const VW_GROUPS=[
+  ['온도',/temp|온도|^t_|^tm_|thermistor|superheat|과열/i],
+  ['압력',/^p_|press|압력/i],
+  ['압축기·팬·EEV',/hz|rpm|fan|eev|speed|회전|comp/i],
+  ['전력·에너지',/^po_|^e_|power|watt|功率|耗电|전력|전류|current/i],
+];
+const vwGroupOf=k=>{for(const[g,re] of VW_GROUPS)if(re.test(k))return g;return'상태·기타'};
+const vwAutoCats=vars=>{
+  const by={};vars.forEach(k=>{const g=vwGroupOf(k);(by[g]=by[g]||[]).push(k)});
+  const out=[];
+  [...VW_GROUPS.map(g=>g[0]),'상태·기타'].forEach(g=>{const vs=by[g]||[];
+    for(let i=0;i<vs.length;i+=9){const part=vs.slice(i,i+9),n=part.length,cols=n<=2?n:(n<=4?2:3);
+      out.push({name:vs.length>9?`${g} ${Math.floor(i/9)+1}`:g,rows:Math.ceil(n/cols),cols,vars:part})}});
+  return out;
+};
+
 // ═══ Viewer 탭 ═══
 function ViewerTab({cfg,autoLoad,clearAutoLoad}){
 const[files,setFiles]=useState([]);
@@ -1465,17 +1487,31 @@ const yTitle=k=>VL[k]?`<b>${VL[k]}</b>`:`<b>${k}</b>`;
 
 // ═══ Viewer: 라인차트 ═══
 function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chartW,setChartW,dragMode,setDragMode,xGap,setXGap,yGap,setYGap}){
+  // 변수명 모드: 자동 / 표준(Calc) / 원본(Merge)
+  const[vmode,setVmode]=useState(()=>{try{return localStorage.getItem('vwc_mode')||'auto'}catch{return'auto'}});
+  useEffect(()=>{try{localStorage.setItem('vwc_mode',vmode)}catch{}},[vmode]);
+  const isMergeData=useMemo(()=>!!cases?.length&&!cases.some(c=>c?.data&&VW_CALC_SIG.some(k=>c.data[k])),[cases]);
+  const mode=vmode==='auto'?(isMergeData?'merge':'calc'):vmode;
   const allVars=useMemo(()=>{
     if(!cases?.length)return[];
     const s=new Set();
     cases.forEach(c=>{if(c?.data)Object.keys(c.data).forEach(k=>{if(!/^Time/i.test(k))s.add(k)})});
-    // 라벨(VL) 기준 가나다 정렬 — 한국어 라벨이 없으면 변수명으로 정렬
+    // 원본 모드: 파일 컬럼 순서 유지, 서버가 붙인 표준명 별칭(원본의 복사본)은 중복이라 숨김
+    if(mode==='merge')return[...s].filter(k=>!(VW_ALIAS_SRC[k]&&s.has(VW_ALIAS_SRC[k])));
+    // 표준 모드: 라벨(VL) 기준 가나다 정렬
     return[...s].sort((a,b)=>(VL[a]||a).localeCompare(VL[b]||b,'ko'));
-  },[cases]);
+  },[cases,mode]);
+  // 표시 이름 — 원본 모드에선 원본명을 앞에 두고 아는 의미를 덧붙임
+  const lab=k=>{
+    if(mode!=='merge'||VL[k])return VL[k]||k;
+    const h=VL[VW_ALIAS_OF[k]];
+    return h?`${k} · ${h}`:k;
+  };
 
   // 탭 = 카테고리 (생성/삭제 가능)
   const initTabs=()=>{
-    const ts=VW_CATS.map((c,i)=>{
+    const cats=mode==='merge'?vwAutoCats(allVars):VW_CATS;
+    const ts=cats.map((c,i)=>{
       const av=c.vars.filter(k=>cases.some(cs=>cs?.data?.[k]));
       const r=c.rows||3,cl=c.cols||3;
       return{id:i,name:c.name,rows:r,cols:cl,plots:av.slice(0,r*cl)}
@@ -1487,7 +1523,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
   // vwRef로 tabs/setTabs 외부 노출 (디폴트 저장/불러오기용)
   useEffect(()=>{if(vwRef)vwRef.current={getTabs:()=>tabs,setTabs:(t)=>setTabs(t)}},[tabs,vwRef]);
   // cases 변경 시 탭 재초기화
-  useEffect(()=>{if(cases?.length)setTabs(initTabs())},[allVars.length]);
+  useEffect(()=>{if(cases?.length)setTabs(initTabs())},[allVars.length,mode]);
 
   const tab=tabs[tabIdx]||tabs[0];
   const updateTab=(upd)=>setTabs(ts=>ts.map((t,i)=>i===tabIdx?{...t,...upd}:t));
@@ -1559,7 +1595,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       const legendFont={size:legendSize,family:fontFamily};
       // HTML 태그 기반 fallback (weight 미지원 버전 대응)
       const wrapB=(s)=>tBold?`<b>${s}</b>`:s;
-      const yTitleClean=k=>VL[k]||k;  // <b> 래핑 제거 → font.weight로 처리
+      const yTitleClean=k=>lab(k);  // 모드별 표시 이름 (<b> 래핑 없이 font.weight로 굵기 처리)
       const lo={grid:{rows:actR,columns:actC,pattern:'independent',xgap:xGap,ygap:yGap},height:totalH,width:finalW,margin:{t:30,b:50,l:80,r:30},paper_bgcolor:'rgba(255,255,255,0)',plot_bgcolor:'#ffffff',font:{family:fontFamily,color:'#3a3a4e',size:tickSize},showlegend:true,legend:{orientation:'h',y:1.06,x:.5,xanchor:'center',font:legendFont},hovermode:'x unified',dragmode:dragMode==='pan'?'pan':'zoom',shapes};
       const yRangeFor=k=>{
         const yr=tab.yranges?.[k];
@@ -1596,7 +1632,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       }
       else setErr('표시할 데이터 없음');
     }catch(e){console.error('VwChart:',e);setErr('렌더링 오류: '+e.message)}
-  },[cases,caseVis,caseColors,lw,chartH,finalW,tab,smOn,smM,smW,dragMode,zones,xGap,yGap]);
+  },[cases,caseVis,caseColors,lw,chartH,finalW,tab,smOn,smM,smW,dragMode,zones,xGap,yGap,mode]);
 
   // 구간 통계
   const zoneStats=useMemo(()=>zones.map(z=>{
@@ -1613,6 +1649,12 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
   {/* ═══════════════════ 카테고리 (상단 가로 바) ═══════════════════ */}
   <div style={{display:'flex',gap:5,alignItems:'center',flexWrap:'wrap',padding:'5px 12px',background:'var(--bg3)',border:'1px solid var(--bd)',borderRadius:8,marginBottom:8,fontSize:11}}>
     <span style={{fontWeight:600,color:'var(--tx2)',fontSize:10,minWidth:50}}>카테고리</span>
+    <div title="Calc 없이 Merge 파일을 볼 때는 원본 모드: 파일에 실제로 있는 변수명으로 카테고리를 자동 구성" style={{display:'flex',border:'1px solid var(--bd2)',borderRadius:6,overflow:'hidden'}}>
+      {[['auto','자동'],['calc','표준(Calc)'],['merge','원본(Merge)']].map(([m,lb])=>(
+        <button key={m} onClick={()=>setVmode(m)} style={{fontSize:9,padding:'3px 8px',border:0,cursor:'pointer',fontFamily:'var(--font)',background:vmode===m?'var(--teal)':'var(--bg)',color:vmode===m?'#fff':'var(--tx2)'}}>{lb}</button>
+      ))}
+    </div>
+    {vmode==='auto'&&<span style={{fontSize:9,color:'var(--tx3)'}}>→ {mode==='merge'?'원본':'표준'}</span>}
     <span style={{width:1,height:14,background:'var(--bd2)'}}/>
     {tabs.map((t,i)=><div key={t.id} style={{display:'flex',alignItems:'center',gap:0}}>
       <button className={`bt bs ${tabIdx===i?'on':''}`} onClick={()=>setTabIdx(i)} style={{borderRadius:tabs.length>1&&i===tabIdx?'6px 0 0 6px':'6px',fontSize:10,padding:'3px 10px'}}>{t.name}</button>
@@ -1774,7 +1816,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
           </div>
           <span style={{fontSize:9,color:'var(--tx3)',minWidth:14,textAlign:'center'}}>{i+1}</span>
           <select value={k} onChange={e=>setPlotVar(i,e.target.value)} style={{flex:1,fontSize:11,padding:'3px 4px',background:'var(--bg)',border:'1px solid var(--bd2)',borderRadius:4,color:'var(--tx)',minWidth:0}}>
-            {allVars.map(v=><option key={v} value={v}>{VL[v]||v}</option>)}
+            {allVars.map(v=><option key={v} value={v}>{lab(v)}</option>)}
           </select>
           <button onClick={()=>removePlot(i)} title="삭제" style={{fontSize:10,border:0,background:0,color:'var(--red)',cursor:'pointer',padding:'0 4px'}}>×</button>
         </div>
