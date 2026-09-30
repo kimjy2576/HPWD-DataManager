@@ -51,6 +51,81 @@ RESULT_DIR.mkdir(exist_ok=True)
 
 _READ_NOTES = []   # _read_csv 진단 메시지 버퍼 → _run_merge 가 UI 로그로 출력
 
+# ── print() → 앱 로그 연결 ─────────────────────────────────────
+# Merge/Calc 실행 중인 스레드의 print() 출력을 CMD 에 그대로 쓰면서
+# 해당 세션의 UI 로그에도 전달한다. ([sync] [classify] [stage1] 등 진단이
+#  CMD 에만 찍혀 사용자가 볼 수 없던 문제 해결). 스레드별로 구분하므로
+#  동시에 여러 세션이 돌아도 로그가 섞이지 않음.
+import threading as _threading, contextlib as _contextlib, functools as _functools
+_LOG_CTX = _threading.local()
+
+
+class _TeeStdout:
+    def __init__(self, real):
+        while isinstance(real, _TeeStdout):   # 이중 설치 방지 (중복 로그 방지)
+            real = real._real
+        self._real = real
+
+    def write(self, s):
+        try:
+            self._real.write(s)
+        except Exception:
+            pass
+        sid = getattr(_LOG_CTX, "sid", None)
+        if sid:
+            buf = getattr(_LOG_CTX, "buf", "") + s
+            *lines, rest = buf.split("\n")
+            _LOG_CTX.buf = rest
+            for ln in lines:
+                if ln.strip():
+                    _log(sid, ln.rstrip())
+        return len(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+_TEE_LOCK = _threading.Lock()
+
+
+def _ensure_tee():
+    """sys.stdout 이 다른 것으로 바뀌었어도 연결기를 다시 씌움."""
+    with _TEE_LOCK:
+        if not isinstance(sys.stdout, _TeeStdout):
+            sys.stdout = _TeeStdout(sys.stdout)
+
+
+_ensure_tee()
+
+
+@_contextlib.contextmanager
+def _log_capture(sid):
+    _ensure_tee()
+    prev = getattr(_LOG_CTX, "sid", None)
+    _LOG_CTX.sid, _LOG_CTX.buf = sid, ""
+    try:
+        yield
+    finally:
+        rest = getattr(_LOG_CTX, "buf", "")
+        if rest.strip():
+            _log(sid, rest.rstrip())
+        _LOG_CTX.sid, _LOG_CTX.buf = prev, ""
+
+
+def _capture_log(fn):
+    """백그라운드 작업(sid 가 첫 인자)의 print() 를 UI 로그로 연결."""
+    @_functools.wraps(fn)
+    def wrapper(sid, *a, **kw):
+        with _log_capture(sid):
+            return fn(sid, *a, **kw)
+    return wrapper
+
 
 def _csv_layout(path, enc, sep, header_row, sample=300):
     """헤더 칸 수와 데이터 칸 수를 비교해 올바른 컬럼 이름 배열을 만든다.
@@ -83,19 +158,35 @@ def _csv_layout(path, enc, sep, header_row, sample=300):
         return {"names": header, "N": N, "M": M, "mode": "ok", "note": note}
     extra = M - N
     commas = sum(h.count(",") for h in header) if sep == "," else 0
-    if commas == extra:
+    # 행 끝의 빈 칸 수 (로거가 각 행 끝에 구분자를 붙이는 경우) — 최빈 폭 행의 95% 이상이 비어야 인정
+    full = [r for r in data if len(r) == M]
+    trail = 0
+    for j in range(1, extra + 1):
+        if full and sum(1 for r in full if not r[-j].strip()) >= 0.95 * len(full):
+            trail = j
+        else:
+            break
+    remain = extra - trail
+    tnames = [f"_trail_{i + 1}" for i in range(trail)]
+    tnote = f"행 끝 빈 칸 {trail}개(구분자로 끝나는 행) 무시" if trail else ""
+
+    if remain == 0:
+        return {"names": header + tnames, "N": N, "M": M, "mode": "trailing",
+                "note": f"헤더 {N}칸 / 데이터 {M}칸 → {tnote} (정상)"}
+    if remain == commas:
         names = []
         for h in header:
             names.append(h)
             names += [f"{h}#{j + 2}" for j in range(h.count(","))]
         split = [h for h in header if "," in h]
-        return {"names": names, "N": N, "M": M, "mode": "comma_split",
+        return {"names": names + tnames, "N": N, "M": M, "mode": "comma_split",
                 "note": f"헤더 {N}칸 / 데이터 {M}칸 → 쉼표 포함 헤더 {len(split)}개가 "
-                        f"데이터에서 분할됨, 정렬 보정: {split}"}
-    names = header + [f"_extra_{i + 1}" for i in range(extra)]
+                        f"데이터에서 분할됨, 정렬 보정: {split}" + (f" / {tnote}" if trail else "")}
+    names = header + [f"_extra_{i + 1}" for i in range(remain)] + tnames
     return {"names": names, "N": N, "M": M, "mode": "pad",
-            "note": f"⚠️ 헤더 {N}칸 / 데이터 {M}칸 — 초과 {extra}칸 원인 불명, "
-                    f"뒤쪽에 임시 이름 부여 (뒤쪽 컬럼 값 확인 필요)"}
+            "note": f"⚠️ 헤더 {N}칸 / 데이터 {M}칸 — 초과 {extra}칸 중 {remain}칸 원인 불명 "
+                    f"(헤더 이름 속 쉼표 {commas}개, 행 끝 빈 칸 {trail}개로 설명 안 됨). "
+                    f"뒤쪽에 임시 이름 부여 — 뒤쪽 컬럼 값 확인 필요"}
 
 
 def _dedupe_names(names):
@@ -193,6 +284,7 @@ def read_source_csv(path, file_rules, src_key, default_skip=1):
             if df is None:
                 continue
             df.columns = [str(c).strip() for c in df.columns]
+            df = df.drop(columns=[c for c in df.columns if c.startswith("_trail_")], errors="ignore")
             return df
         except Exception as e:
             msg = f"  [read_csv] {os.path.basename(path)} ({enc}) 읽기 실패: {type(e).__name__}: {e}"
@@ -724,6 +816,7 @@ async def start_merge(req: MergeRequest, background_tasks: BackgroundTasks):
     return {"status": "started", "mode": "merge"}
 
 
+@_capture_log
 def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
     s = sessions[sid]
     category = Path(s["category_path"])
@@ -732,6 +825,7 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
 
     try:
         _log(sid, "═══ Merge 시작 ═══")
+        _log(sid, f"  환경: Python {sys.version.split()[0]} / pandas {pd.__version__}")
         from preprocessor import (
             preprocess_blackrose, preprocess_ams, preprocess_mx100,
             sync_and_merge, add_time_columns, _fuzzy_col_match,
@@ -782,9 +876,8 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
 
                 t1 = time.perf_counter()
                 df_ams, df_br, df_mx, df_ni = _read(ap, bp, mp_list, dt, np_list=np_list, file_rules=cfg.get("file_rules"))
-                while _READ_NOTES:
-                    _log(sid, _READ_NOTES.pop(0))
-                _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={len(df_ni)}행/{len(cf.get('nidaq',[]))}파일)")
+                _READ_NOTES.clear()   # 내용은 print() 로 이미 로그에 전달됨
+                _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (AMS={len(df_ams)}행 BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={len(df_ni)}행/{len(cf.get('nidaq',[]))}파일)")
 
                 t1 = time.perf_counter()
                 # 선택된 소스만 전처리
@@ -801,8 +894,7 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                         get_selected_columns(cfg, "ams"))
                 else:
                     df_ams_proc = pd.DataFrame()
-                for _ln in df_ams_proc.attrs.get("ams_diag", []) if not df_ams_proc.empty else []:
-                    _log(sid, _ln)
+                # [ams] 진단은 preprocess_ams 의 print() 로 이미 로그에 전달됨
 
                 if use_mx and not df_mx.empty:
                     df_mx_proc = preprocess_mx100(df_mx, cfg["mx100"]["useless_columns"])
@@ -1086,6 +1178,7 @@ async def start_calculation(req: CalcRequest, background_tasks: BackgroundTasks)
     return {"status": "started", "mode": "calculate", "source_count": len(source), "session_id": sid}
 
 
+@_capture_log
 def _run_calc(sid: str, cfg: dict, source_files: list[str],
               exp: dict | None, var_map: dict | None):
     s = sessions[sid]

@@ -349,6 +349,26 @@ def preprocess_mx100(
 # ══════════════════════════════════════════════
 #  시간 동기화 & 병합
 # ══════════════════════════════════════════════
+def _robust_start_time(series):
+    """기준 시작시각 — 시리즈 전체를 파싱해 첫 유효값을 사용.
+
+    parse_flexible_datetime 은 문자열의 '00:00:00' 을 지우는 처리가 있어
+    경과시간이 00:00:00 부터 시작하면 빈 문자열 → NaT 가 됨 (1행 병합 버그의 원인).
+    """
+    try:
+        dt = pd.to_datetime(series, errors="coerce", format="mixed")
+    except (TypeError, ValueError):
+        dt = pd.to_datetime(series, errors="coerce")
+    dt = dt.dropna()
+    if len(dt):
+        return dt.iloc[0]
+    for v in series:
+        t = parse_flexible_datetime(v)
+        if pd.notna(t):
+            return t
+    return pd.NaT
+
+
 def sync_and_merge(
     dfs: list[pd.DataFrame],
     data_time: str,
@@ -374,8 +394,12 @@ def sync_and_merge(
         print("  [sync] 사용 가능한 시간축 소스가 없음")
         return pd.DataFrame({"Time": pd.to_datetime([])})
 
-    start_time = parse_flexible_datetime(ref_df["Time"].iloc[0])
-    print(f"  [sync] 기준시간: {start_time}, data_time={data_time}")
+    start_time = _robust_start_time(ref_df["Time"])
+    print(f"  [sync] 기준시간: {start_time}, data_time={data_time} "
+          f"(원본 첫 값 '{ref_df['Time'].iloc[0]}')")
+    if pd.isna(start_time):
+        raise ValueError(f"기준 시간축({data_time})의 Time 을 해석할 수 없음 — "
+                         f"예: '{ref_df['Time'].iloc[0]}', '{ref_df['Time'].iloc[-1]}'")
 
     # 중복 제거 + 시간 변환
     clean_dfs = []
@@ -399,7 +423,7 @@ def sync_and_merge(
             clean_dfs.append(df)
 
     if not clean_dfs:
-        return pd.DataFrame({"Time": [0]})
+        raise ValueError("시간 정리 후 남은 데이터가 없음 — 모든 소스의 Time 이 비었거나 변환에 실패")
 
     # end_time: 첫 번째 clean_df에서
     end_time = clean_dfs[0]["Time"].iloc[-1]
@@ -407,10 +431,18 @@ def sync_and_merge(
     # 1초 간격 시간축
     try:
         time_index = pd.date_range(start=start_time, end=end_time, freq="s", name="Time")
-        print(f"  [sync] time_index: {len(time_index)}초")
+        print(f"  [sync] time_index: {len(time_index)}초 ({time_index[0]} ~ {time_index[-1]})")
+        for di, cdf in enumerate(clean_dfs):
+            lo, hi = cdf["Time"].iloc[0], cdf["Time"].iloc[-1]
+            ov = int(((time_index >= lo) & (time_index <= hi)).sum())
+            if ov == 0:
+                print(f"  [sync] ⚠️ df[{di}] 시간 범위 {lo} ~ {hi} 가 기준 격자와 겹치지 않음 "
+                      f"→ 이 소스는 전부 빈 값 (경과시간 vs 벽시계 시간 혼용 의심)")
+            elif ov < len(time_index) * 0.5:
+                print(f"  [sync] ⚠️ df[{di}] 기준 격자의 {ov/len(time_index)*100:.0f}%만 겹침")
     except Exception as e:
         print(f"  [sync] date_range 실패: {e}")
-        return pd.DataFrame({"Time": [0]})
+        raise ValueError(f"시간 격자 생성 실패 (시작={start_time}, 끝={end_time}): {e}") from e
 
     # reindex (각 df별 try/except)
     resampled = []
@@ -433,7 +465,7 @@ def sync_and_merge(
                 print(f"  [sync] df[{di}] 폴백도 실패: {e2}")
 
     if not resampled:
-        return pd.DataFrame({"Time": [0]})
+        raise ValueError("모든 소스의 재색인(1초 격자 맞춤)이 실패 — 위 [sync] 로그 확인")
 
     # 병합 (중복 컬럼 제거)
     merged = pd.concat(resampled, axis=1)
