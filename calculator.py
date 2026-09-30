@@ -10,6 +10,33 @@ import pandas as pd
 from properties import get_props
 
 
+# AMS 표준명 → 앱 표준명(그래프 카테고리·계산에서 쓰는 이름) 별칭
+#   앱 이름이 없을 때만 AMS 값을 복사해서 채움 (기존 값은 절대 덮어쓰지 않음)
+STD_ALIASES = {
+    "T_Air_Eva_In":   ("Heatpump_DuctInTemp",),   # 증발기 공기 입구 (= 덕트 입구)
+    "T_Air_Cond_Out": ("Heatpump_DuctOutTemp",),  # 응축기 공기 출구 (= 덕트 출구)
+    "T_Eva_In":       ("Heatpump_EvaInTemp",),    # 증발기 냉매 입구
+    "T_Eva_Out":      ("Heatpump_EvaOutTemp",),   # 증발기 냉매 출구
+    "T_Comp_Body":    ("Heatpump_CompTemp",),     # 압축기 토출(바디)
+}
+
+
+def apply_std_aliases(df: pd.DataFrame, log: bool = True) -> pd.DataFrame:
+    """앱 표준명이 없으면 AMS 표준명 값으로 채움. 추가된 별칭은 로그로 남김."""
+    added = []
+    for std, srcs in STD_ALIASES.items():
+        if std in df.columns:
+            continue
+        for src in srcs:
+            if src in df.columns:
+                df[std] = df[src].values
+                added.append(f"{std}←{src}")
+                break
+    if added and log:
+        print(f"  [alias] 앱 표준명 별칭 {len(added)}개: {', '.join(added)}")
+    return df
+
+
 def run_stage1(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """Stage 1 계산 실행.
 
@@ -28,6 +55,9 @@ def run_stage1(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         except Exception as e:
             print(f"  [stage1] {label} 실패 — {type(e).__name__}: {e}")
         return None
+
+    # AMS 이름으로 들어온 온도를 앱 표준명으로도 제공 (그래프 카테고리·Calc 가 찾는 이름)
+    df = apply_std_aliases(df)
 
     if setup == "MX100":
         out = _try("MX100 유도", lambda: _derive_missing_mx100(df))

@@ -1263,6 +1263,11 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
 
             # Stage 2 실행 (파일별 실험값 지원)
             file_exp = exp.get(fn, exp) if isinstance(exp, dict) and fn in exp else exp
+            try:
+                from calculator import apply_std_aliases
+                df = apply_std_aliases(df)   # 옛 merged 파일도 앱 표준명으로 계산
+            except Exception as _e:
+                print(f"  [alias] 적용 실패: {_e}")
             df_calc = run_stage2(df, cfg, file_exp, filename=fn)
             _log(sid, f"  계산 완료: {len(df_calc.columns)}열")
             rh_mode = "측정값 사용" if "RH_Eva_In" in df.columns else "에너지밸런스 역산 (수렴 반복)"
@@ -1632,6 +1637,12 @@ def viewer_data(fn: str, max_rows: int = 7200):
         raise HTTPException(404, f"파일 없음: {fn}")
     try:
         df = pd.read_csv(p)
+        # 이 수정 이전에 만든 merged/calc 파일도 그래프 카테고리 이름으로 보이도록 별칭 보강
+        try:
+            from calculator import apply_std_aliases
+            df = apply_std_aliases(df, log=False)
+        except Exception:
+            pass
     except Exception as e:
         raise HTTPException(400, f"CSV 읽기 실패: {str(e)}")
     if len(df) > max_rows:
