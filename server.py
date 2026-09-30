@@ -273,10 +273,32 @@ def read_source_csv(path, file_rules, src_key, default_skip=1):
                   skiprows=sk + 1, index_col=False, encoding_errors="replace")
         try:
             return pd.read_csv(path, low_memory=False, **kw)
-        except Exception:
-            # 일부 행만 폭이 다르면 python 엔진으로 초과분을 잘라서 읽음
-            return pd.read_csv(path, engine="python",
-                               on_bad_lines=lambda row: row[:len(names)], **kw)
+        except Exception as e_fast:
+            # 칸 수가 다른 행이 있으면 python 엔진으로 초과분을 잘라서 읽음 (느림) — 반드시 보고
+            bad = []
+            def _cut(row):
+                bad.append(len(row))
+                return row[:len(names)]
+            df_ = pd.read_csv(path, engine="python", on_bad_lines=_cut, **kw)
+            # python 파서는 index_col=False 일 때 초과 칸을 콜백 없이 잘라버려 직접 셈 (느린 경로에서만 실행)
+            import csv as _csv
+            from collections import Counter as _C
+            cnt, lines_ = _C(), []
+            with open(path, encoding=enc, errors="replace", newline="") as fh:
+                rd_ = _csv.reader(fh, delimiter=sep)
+                for i_, row_ in enumerate(rd_):
+                    if i_ <= sk or not row_ or len(row_) <= len(names):
+                        continue
+                    cnt[len(row_)] += 1
+                    if len(lines_) < 3:
+                        lines_.append(rd_.line_num)
+            bad = [w for w, n in cnt.items() for _ in range(n)]
+            dist = ", ".join(f"{w}칸 {n}행" for w, n in sorted(cnt.items())) or "개수 미상"
+            first = f"{lines_}번째 줄" if lines_ else str(e_fast).strip().splitlines()[-1][:90]
+            msg = (f"  [read_csv] {os.path.basename(path)}: ⚠️ 칸 수가 다른 행 {len(bad)}개({dist}) "
+                   f"→ 초과분 잘라서 읽음 / 느린 파서로 전환되어 읽기 시간 증가 (첫 위치: {first})")
+            print(msg); _READ_NOTES.append(msg)
+            return df_
 
     for enc in [enc_used, "utf-8", "cp949", "latin1"]:
         try:

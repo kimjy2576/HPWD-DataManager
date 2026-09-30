@@ -162,6 +162,13 @@ def preprocess_ams(
     df = df.loc[:, ~df.columns.duplicated(keep="first")]
     diag = []
 
+    # 파일 중간에 헤더가 반복된 행(로거 재연결) 제거 — 남겨두면 모든 컬럼에 문자가 섞임
+    if "Time" in df.columns:
+        hdr_rows = df["Time"].astype(str).str.strip().eq("Time")
+        if hdr_rows.any():
+            diag.append(f"  [ams] ⚠️ 파일 중간 헤더 반복 {int(hdr_rows.sum())}행 제거 (로거 재연결로 보임)")
+            df = df[~hdr_rows].reset_index(drop=True)
+
     # 매핑된 수치 컬럼: 숫자화 + 0xFFFF(65535) 무효값 → NaN
     mapped = list(dict.fromkeys(v for k, v in column_mapping.items()
                                 if k in raw_cols and v in df.columns))
@@ -170,6 +177,13 @@ def preprocess_ams(
         if c in ("SubProcess", "Time"):
             continue
         v = pd.to_numeric(df[c], errors="coerce")
+        if not pd.api.types.is_numeric_dtype(df[c]):   # pandas 3 의 str 타입 포함
+            txt = df[c].astype(str).str.strip()
+            nonnum = df[c].notna() & v.isna() & (txt != "") & (txt.str.lower() != "nan")
+            nn = int(nonnum.sum())
+            if nn:
+                ex = txt[nonnum].str.slice(0, 12).value_counts().head(3).index.tolist()
+                diag.append(f"  [ams] ⚠️ {c}: 숫자가 아닌 값 {nn}개 → 빈 값 처리 (예: {ex})")
         bad = v == 65535
         if bad.any():
             n_sent += int(bad.sum())
