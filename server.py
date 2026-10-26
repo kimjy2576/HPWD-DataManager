@@ -889,16 +889,38 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
             _log(sid, f"  변수 설정: {len(included)}개 포함, {len(excluded)}개 제외, {len(wb_applied)}개 W&B, {len(renamed)}개 이름변경")
 
         ref_map = {"BR":"br","AMS":"ams","MX100":"mx100","NIDAQ":"nidaq"}
-        total = sum(len(cf.get(ref_map.get(dt,"br"), [])) for cf in case_files.values())
-        done, results = 0, []
 
-        for case_name, cf in case_files.items():
+        def _plan_ref(cf):
+            """케이스별 실제 기준 시간축과 병합 횟수.
+            설정한 기준(dt) 소스의 파일이 그 케이스에 없으면 BR → AMS → MX100 → NIDAQ
+            순으로 파일이 있는 소스로 대체한다. (예전에는 0회 반복 → 'Merge 완료: 0개'로
+            아무 경고 없이 끝났다.) BR/AMS 는 파일 1개 = 시험 1회, 대체된 MX100/NIDAQ 는
+            여러 파일을 열 방향으로 합쳐 1회로 본다."""
+            rk = ref_map.get(dt, "br")
+            if dt in sources and cf.get(rk):
+                return dt, len(cf[rk])
+            for alt in ("BR", "AMS", "MX100", "NIDAQ"):
+                if alt in sources and cf.get(ref_map[alt]):
+                    return alt, (len(cf[ref_map[alt]]) if alt in ("BR", "AMS") else 1)
+            return None, 0
+
+        # 1단계: 케이스별 파일 판별 + 병합 계획 (진행률 분모를 정확히 하기 위해 먼저 수행)
+        plans = []
+        for case_name in case_files:
             case_dir = category / case_name
             rename_files_in_folder(str(case_dir))
             cf = _classify_files(case_dir, cfg.get("file_rules"), sources)
-            ref_key = {"BR":"br","AMS":"ams","MX100":"mx100","NIDAQ":"nidaq"}.get(dt,"br")
-            n = len(cf.get(ref_key, []))
+            ref_eff, n = _plan_ref(cf)
+            found = ", ".join(f"{k.upper()} {len(v)}개" for k, v in cf.items() if v) or "없음"
+            if n == 0:
+                _log(sid, f"  ⚠️ [{case_name}] 병합할 파일 없음 (판별된 파일: {found}) → 건너뜀")
+            elif ref_eff != dt:
+                _log(sid, f"  ⚠️ [{case_name}] 기준 시간축 '{dt}' 파일 없음 → '{ref_eff}' 기준으로 병합 ({found})")
+            plans.append((case_name, case_dir, cf, ref_eff, n))
+        total = sum(p[4] for p in plans)
+        done, results = 0, []
 
+        for case_name, case_dir, cf, ref_eff, n in plans:
             for i in range(n):
                 t0 = time.perf_counter()
                 _log(sid, f"[{case_name}] {i+1}/{n} 병합 중...")
@@ -956,7 +978,7 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 t1 = time.perf_counter()
                 merged = sync_and_merge(
                     [df_br_main, df_br_add, df_mx_proc, df_ams_proc, df_ni_proc],
-                    dt, df_br_main, df_ams_proc, df_mx_proc)
+                    ref_eff, df_br_main, df_ams_proc, df_mx_proc, df_nidaq=df_ni_proc)
                 _log(sid, f"  🔗 시간동기화: {time.perf_counter()-t1:.1f}s ({len(merged)}행)")
 
                 # 디버그: 압력/온도 컬럼 존재 여부
@@ -1034,6 +1056,14 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 _log(sid, f"  → {out_name} (총 {el:.1f}초, {len(merged)}행×{len(merged.columns)}열)")
                 done += 1
                 s["progress"] = int(done / max(total, 1) * 100)
+
+        if not results:
+            msg = ("병합된 파일이 없습니다 — 선택한 케이스 폴더에서 사용 소스("
+                   + ", ".join(sources) + ") 파일을 찾지 못했습니다. "
+                   "위 [classify] 로그와 설정 → 파일 식별 규칙(확장자/포함 패턴)을 확인하세요.")
+            s.update(merge_results=[], status="error", error=msg, progress=100)
+            _log(sid, f"\n❌ {msg}")
+            return
 
         s.update(merge_results=results, status="done", progress=100)
         _log(sid, f"\n═══ Merge 완료: {len(results)}개 파일 ═══")

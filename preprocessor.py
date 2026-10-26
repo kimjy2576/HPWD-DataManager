@@ -389,16 +389,19 @@ def sync_and_merge(
     df_br: pd.DataFrame,
     df_ams: pd.DataFrame,
     df_mx100: pd.DataFrame,
+    df_nidaq: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     여러 DataFrame을 기준 시간축(1초 간격)으로 리샘플링·병합.
+    시간 격자는 기준 소스의 시작~끝으로 만든다.
     [v3 최적화] reindex를 한번에 처리, ref_df 이중 변환 제거.
     """
-    ref_map = {"BR": df_br, "AMS": df_ams, "MX100": df_mx100}
+    ref_map = {"BR": df_br, "AMS": df_ams, "MX100": df_mx100,
+               "NIDAQ": df_nidaq if df_nidaq is not None else pd.DataFrame()}
     ref_df = ref_map.get(data_time, pd.DataFrame())
     # 지정된 기준 소스가 비어 있으면 사용 가능한 다른 소스로 자동 폴백
     if ref_df.empty or "Time" not in ref_df.columns:
-        for alt in ["BR", "AMS", "MX100"]:
+        for alt in ["BR", "AMS", "MX100", "NIDAQ"]:
             cand = ref_map.get(alt, pd.DataFrame())
             if not cand.empty and "Time" in cand.columns:
                 print(f"  [sync] 기준 시간축 '{data_time}' 없음 → '{alt}'로 자동 전환")
@@ -417,9 +420,11 @@ def sync_and_merge(
 
     # 중복 제거 + 시간 변환
     clean_dfs = []
+    ref_clean = None
     for i, df in enumerate(dfs):
         if df.empty or "Time" not in df.columns:
             continue
+        is_ref = df is ref_df
         df = df.copy()
         df = df.drop_duplicates(subset="Time", keep="first").reset_index(drop=True)
         _align_datetime_to_base(df, start_time)
@@ -435,12 +440,16 @@ def sync_and_merge(
         if len(df) > 0:
             print(f"  [sync] df[{i}]: {len(df)}행 {len(df.columns)}열, Time={df['Time'].iloc[0]}~{df['Time'].iloc[-1]}")
             clean_dfs.append(df)
+            if is_ref:
+                ref_clean = df
 
     if not clean_dfs:
         raise ValueError("시간 정리 후 남은 데이터가 없음 — 모든 소스의 Time 이 비었거나 변환에 실패")
 
-    # end_time: 첫 번째 clean_df에서
-    end_time = clean_dfs[0]["Time"].iloc[-1]
+    # end_time: 기준 소스의 마지막 시각 (기준이 목록에 없으면 첫 소스)
+    # 예전에는 항상 dfs[0](BR)을 썼기 때문에 BR 없이 AMS 기준으로 대체되면
+    # MX100 등 다른 소스의 끝 시각으로 격자가 잘리거나 늘어났다.
+    end_time = (ref_clean if ref_clean is not None else clean_dfs[0])["Time"].max()
 
     # 1초 간격 시간축
     try:

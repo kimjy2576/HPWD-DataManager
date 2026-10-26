@@ -75,7 +75,7 @@ return(<div className="app"><div className="hdr" style={{display:'flex',alignIte
   <button className={`tb ${tab==='viewer'?'on':''}`} onClick={()=>setTab('viewer')}>Visualization</button>
   <button className={`tb ${tab==='config'?'on':''}`} onClick={()=>setTab('config')}>Setting</button>
 </div>
-<div style={{display:tab==='merge'?'block':'none'}}>{cfg&&<MergeTab cfg={cfg} sid={sid} setSid={setSid} st={mergeSt} setSt={setMergeSt} setTab={setTab} setCalcAutoFiles={setCalcAutoFiles}/>}</div>
+<div style={{display:tab==='merge'?'block':'none'}}>{cfg&&<MergeTab cfg={cfg} sid={sid} setSid={setSid} st={mergeSt} setSt={setMergeSt} setTab={setTab} setCalcAutoFiles={setCalcAutoFiles} setViewerAutoLoad={setViewerAutoLoad}/>}</div>
 <div style={{display:tab==='calc'?'block':'none'}}>{cfg&&<CalcTab cfg={cfg} setCfg={setCfg} sid={sid} setSid={setSid} st={calcSt} setSt={setCalcSt} setTab={setTab} setViewerAutoLoad={setViewerAutoLoad} calcAutoFiles={calcAutoFiles} clearCalcAutoFiles={()=>setCalcAutoFiles(null)}/>}</div>
 <div style={{display:tab==='formula'?'block':'none'}}><FormulaTab/></div>
 <div style={{display:tab==='viewer'?'block':'none'}}><ViewerTab cfg={cfg} autoLoad={viewerAutoLoad} clearAutoLoad={()=>setViewerAutoLoad(null)}/></div>
@@ -288,7 +288,7 @@ return(<>
 </>)}
 
 // ═══ Merge 탭 ═══
-function MergeTab({cfg,sid,setSid,st,setSt,setTab,setCalcAutoFiles}){
+function MergeTab({cfg,sid,setSid,st,setSt,setTab,setCalcAutoFiles,setViewerAutoLoad}){
 const[poll,setPoll]=useState(false);const pr=useRef();
 const[varCols,setVarCols]=useState(null);  // 스캔된 컬럼 {col: {source,dtype}}
 const[varSet,setVarSet]=useState({});       // 변수 설정 {col: {include,weight,bias}}
@@ -478,6 +478,11 @@ return(<div>
         setCalcAutoFiles(st.merge_results);
         setTab('calc');
       }} style={{background:'#3b82f6',borderColor:'#3b82f6'}}>🧮 Calculation으로 → ({st.merge_results.length}개 파일)</button>
+      <button className="bt bg" onClick={()=>{
+        setViewerAutoLoad?.({files:st.merge_results,mode:'merge'});
+        setTab('viewer');
+      }} style={{marginLeft:8,background:'var(--teal)',borderColor:'var(--teal)'}}>📊 바로 그래프 보기 →</button>
+      <span className="it" style={{marginLeft:8}}>Calculation 없이 merged 파일을 원본(Merge) 모드로 표시</span>
     </div>}
   </div>}
 </div>)}
@@ -1096,11 +1101,15 @@ useEffect(()=>{reloadFiles()},[]);
 
 // autoLoad: Calc 완료 후 자동 로드
 const[pendingLoad,setPendingLoad]=useState(false);
-useEffect(()=>{if(!autoLoad?.length)return;
+const[modeReq,setModeReq]=useState(null);   // Merge 탭 '바로 그래프 보기' → 개별선도 모드 요청
+useEffect(()=>{
+  const alFiles=Array.isArray(autoLoad)?autoLoad:(autoLoad?.files||[]);
+  if(!alFiles.length)return;
+  if(autoLoad?.mode)setModeReq({mode:autoLoad.mode,t:Date.now()});
   fetch(`${API}/api/results`).then(r=>r.json()).then(d=>{
     const filtered=d.filter(f=>f.name.includes('_calc')||f.name.includes('_merged'));
     setFiles(filtered);
-    const toSel=new Set(autoLoad.filter(fn=>filtered.some(f=>f.name===fn)));
+    const toSel=new Set(alFiles.filter(fn=>filtered.some(f=>f.name===fn)));
     setSelFiles(toSel);
     setMergeMode('auto'); // auto: base명 매칭으로 merged+calc 병합
     if(clearAutoLoad)clearAutoLoad();
@@ -1219,7 +1228,7 @@ const loadData=async()=>{if(!selFiles.size)return;setLoading(true);setLoadMsg(''
     const psychCk=['T_Air_Eva_In','AH_Eva_In','AH_Cond_In','T_Air_Cond_Out','AH_Cond_Out'].map(k=>allCols.has(k)?'✓':'✗');
     logs.push(`  습공기: ${psychCk.join(' ')}`);
     logs.push(`  → ${groupName}: ${allCols.size}col, ${totalRows}rows`);
-    arr.push({name:groupName,data:D,columns:[...allCols],rows:totalRows});
+    arr.push({name:groupName,data:D,columns:[...allCols],rows:totalRows,files:sorted,derived:added});
   }
   logs.push(`\n총 ${arr.length}건`);setDbg(logs.join('\n'));
   setCases(arr);const v={};arr.forEach(c=>v[c.name]=true);setCaseVis(v);setLoading(false);
@@ -1404,7 +1413,7 @@ return(<div>
   </div>
 
   <ErrorBound>
-  <div style={{display:sub==='chart'?'block':'none'}}><VwChart vwRef={vwChartRef} cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} setDragMode={setDragMode} xGap={xGap} setXGap={setXGap} yGap={yGap} setYGap={setYGap}/></div>
+  <div style={{display:sub==='chart'?'block':'none'}}><VwChart vwRef={vwChartRef} modeReq={modeReq} cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} setDragMode={setDragMode} xGap={xGap} setXGap={setXGap} yGap={yGap} setYGap={setYGap}/></div>
   <div style={{display:sub==='psych'?'block':'none'}}><VwPsych cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode}/></div>
   <div style={{display:sub==='ph'?'block':'none'}}><VwPh cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} cfg={cfg}/></div>
   <div style={{display:sub==='perf'?'block':'none'}}><VwPerf cases={cases} caseVis={caseVis} caseColors={caseColors} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW}/></div>
@@ -1486,18 +1495,31 @@ const VL={
 const yTitle=k=>VL[k]?`<b>${VL[k]}</b>`:`<b>${k}</b>`;
 
 // ═══ Viewer: 라인차트 ═══
-function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chartW,setChartW,dragMode,setDragMode,xGap,setXGap,yGap,setYGap}){
+function VwChart({vwRef,modeReq,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chartW,setChartW,dragMode,setDragMode,xGap,setXGap,yGap,setYGap}){
   // 변수명 모드: 자동 / 표준(Calc) / 원본(Merge)
   const[vmode,setVmode]=useState(()=>{try{return localStorage.getItem('vwc_mode')||'auto'}catch{return'auto'}});
   useEffect(()=>{try{localStorage.setItem('vwc_mode',vmode)}catch{}},[vmode]);
-  const isMergeData=useMemo(()=>!!cases?.length&&!cases.some(c=>c?.data&&VW_CALC_SIG.some(k=>c.data[k])),[cases]);
+  // '바로 그래프 보기'로 들어오면 자동 모드로 되돌림 (merged 파일이면 원본으로 판정됨)
+  useEffect(()=>{if(modeReq)setVmode('auto')},[modeReq]);
+  const isMergeData=useMemo(()=>{
+    if(!cases?.length)return false;
+    // 1순위: 케이스가 어떤 파일에서 왔는지 — 전부 _merged 파일이면 원본
+    if(cases.every(c=>Array.isArray(c?.files)&&c.files.length))
+      return cases.every(c=>c.files.every(f=>/_merged/i.test(f)&&!/_calc|_formula/i.test(f)));
+    // 2순위(출처 정보 없을 때): Calc 산출 변수가 하나도 없으면 원본
+    return !cases.some(c=>c?.data&&VW_CALC_SIG.some(k=>c.data[k]));
+  },[cases]);
   const mode=vmode==='auto'?(isMergeData?'merge':'calc'):vmode;
   const allVars=useMemo(()=>{
     if(!cases?.length)return[];
     const s=new Set();
     cases.forEach(c=>{if(c?.data)Object.keys(c.data).forEach(k=>{if(!/^Time/i.test(k))s.add(k)})});
     // 원본 모드: 파일 컬럼 순서 유지, 서버가 붙인 표준명 별칭(원본의 복사본)은 중복이라 숨김
-    if(mode==='merge')return[...s].filter(k=>!(VW_ALIAS_SRC[k]&&s.has(VW_ALIAS_SRC[k])));
+    if(mode==='merge'){
+      // Viewer 가 선도용으로 가정값(RH 95% 등)을 넣어 만든 컬럼은 파일에 없는 값이므로 원본 모드에선 숨김
+      const derived=new Set(cases.flatMap(c=>c?.derived||[]));
+      return[...s].filter(k=>!derived.has(k)&&!(VW_ALIAS_SRC[k]&&s.has(VW_ALIAS_SRC[k])));
+    }
     // 표준 모드: 라벨(VL) 기준 가나다 정렬
     return[...s].sort((a,b)=>(VL[a]||a).localeCompare(VL[b]||b,'ko'));
   },[cases,mode]);
@@ -1588,6 +1610,23 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       const actC=Math.max(1,Math.min(tab.cols,nPlots.length));
       const tr=[];const shapes=[];
       const totalH=mode==='merge'?Math.round(actR*Math.max(180,chartH/3)):Math.max(actR*120,chartH); // 표준: chartH=총 높이 / 원본: 행당 chartH÷3
+      // WebGL 캔버스는 브라우저·GPU별 크기 한도(4096~16384 px)가 있어, 넘으면 선이 축과 어긋나게 그려짐
+      // → 화면 픽셀 기준 4096 을 넘으면 SVG 로 그림 (느리지만 위치 정확)
+      const dpr=window.devicePixelRatio||1;
+      const useGL=totalH*dpr<=4096&&(finalW||containerW||1600)*dpr<=4096;
+      const trType=useGL?'scattergl':'scatter';
+      // SVG 는 점이 많으면 무거우므로 구간별 최소·최대값을 남기는 방식으로 줄임 (스파이크 보존)
+      const thin=(x,y,maxN)=>{
+        if(useGL||y.length<=maxN)return[x,y];
+        const b=Math.ceil(y.length/(maxN/2)),ox=[],oy=[];
+        for(let i=0;i<y.length;i+=b){
+          let lo=-1,hi=-1;
+          for(let j=i;j<Math.min(i+b,y.length);j++){const v=y[j];if(v==null)continue;if(lo<0||v<y[lo])lo=j;if(hi<0||v>y[hi])hi=j}
+          if(lo<0){ox.push(x[i]);oy.push(null);continue}
+          const a=Math.min(lo,hi),c=Math.max(lo,hi);ox.push(x[a]);oy.push(y[a]);if(c!==a){ox.push(x[c]);oy.push(y[c])}
+        }
+        return[ox,oy];
+      };
 
       const fontMap={sans:'system-ui,-apple-system,"Segoe UI",Roboto,sans-serif',mono:'ui-monospace,"SF Mono",Consolas,monospace',serif:'Georgia,"Times New Roman",serif'};
       const fontFamily=fontMap[tab.fontFamily||'sans'];
@@ -1602,7 +1641,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       // HTML 태그 기반 fallback (weight 미지원 버전 대응)
       const wrapB=(s)=>tBold?`<b>${s}</b>`:s;
       const yTitleClean=k=>VL[k]||k;  // 축 제목은 짧게 (원본 모드의 '원본명 · 의미' 표기는 드롭다운에서만)
-      const lo={grid:{rows:actR,columns:actC,pattern:'independent',xgap:xGap,ygap:yGap},height:totalH,width:finalW,margin:{t:30,b:50,l:80,r:30},paper_bgcolor:'rgba(255,255,255,0)',plot_bgcolor:'#ffffff',font:{family:fontFamily,color:'#3a3a4e',size:tickSize},showlegend:true,legend:{orientation:'h',y:1.06,x:.5,xanchor:'center',font:legendFont},hovermode:'x unified',dragmode:dragMode==='pan'?'pan':'zoom',shapes};
+      const lo={grid:{rows:actR,columns:actC,pattern:'independent',xgap:xGap,ygap:yGap},height:totalH,width:finalW,margin:{t:30,b:50,l:80,r:30},paper_bgcolor:'rgba(255,255,255,0)',plot_bgcolor:'#ffffff',font:{family:fontFamily,color:'#3a3a4e',size:tickSize},showlegend:true,legend:{orientation:'h',y:1+12/Math.max(100,totalH-80),yanchor:'bottom',x:.5,xanchor:'center',font:legendFont},hovermode:'x unified',dragmode:dragMode==='pan'?'pan':'zoom',shapes};
       const yRangeFor=k=>{
         const yr=tab.yranges?.[k];
         const hasMin=yr?.[0]!=null&&yr[0]!==''&&!isNaN(+yr[0]);
@@ -1619,11 +1658,12 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
         zones.forEach((z,zi)=>{shapes.push({type:'rect',xref:xk,yref:yk+' domain',x0:z.start,x1:z.end,y0:0,y1:1,fillcolor:VW_ZC[zi%VW_ZC.length],line:{color:VW_ZB[zi%VW_ZB.length],width:1,dash:'dot'},layer:'below'})});
         cases.forEach((cs,ci)=>{
           if(!cs?.data||!caseVis[cs.name]||!cs.data[k])return;
-          const xArr=cs.data.Time_min||cs.data.Time_sec||cs.data.Time;
+          let xArr=cs.data.Time_min||cs.data.Time_sec||cs.data.Time;
           if(!xArr?.length)return;
           let yArr=cs.data[k];if(!yArr?.length)return;
           if(smOn&&yArr.length>3)try{yArr=vSmooth(yArr,smM,smW)}catch(e){}
-          tr.push({x:xArr,y:yArr,type:'scattergl',mode:'lines',name:cs.label||cs.name,legendgroup:cs.name,showlegend:pi===0,line:{color:(caseColors?.[cs.name]||VW_COLORS[ci%VW_COLORS.length]),width:lw},xaxis:xk,yaxis:yk,hovertemplate:'%{y:.2f}<extra>'+(cs.label||cs.name)+'</extra>'});
+          [xArr,yArr]=thin(xArr,yArr,3000);
+          tr.push({x:xArr,y:yArr,type:trType,mode:'lines',name:cs.label||cs.name,legendgroup:cs.name,showlegend:pi===0,line:{color:(caseColors?.[cs.name]||VW_COLORS[ci%VW_COLORS.length]),width:lw},xaxis:xk,yaxis:yk,hovertemplate:'%{y:.2f}<extra>'+(cs.label||cs.name)+'</extra>'});
         });
       });
       if(tr.length){
@@ -1638,7 +1678,7 @@ function VwChart({vwRef,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chart
       }
       else setErr('표시할 데이터 없음');
     }catch(e){console.error('VwChart:',e);setErr('렌더링 오류: '+e.message)}
-  },[cases,caseVis,caseColors,lw,chartH,finalW,tab,smOn,smM,smW,dragMode,zones,xGap,yGap,mode]);
+  },[cases,caseVis,caseColors,lw,chartH,finalW,tab,smOn,smM,smW,dragMode,zones,xGap,yGap,mode,containerW]);
 
   // 구간 통계
   const zoneStats=useMemo(()=>zones.map(z=>{
