@@ -81,9 +81,13 @@ def _fuzzy_col_match(df_columns, wanted_columns):
     result = []
     for w in wanted_columns:
         if w in df_columns:
-            result.append(w)  # 정확 매칭 우선
+            hit = w                      # 정확 매칭 우선
         elif norm(w) in col_map:
-            result.append(col_map[norm(w)])  # 퍼지 매칭
+            hit = col_map[norm(w)]       # 퍼지 매칭
+        else:
+            continue
+        if hit not in result:            # 같은 컬럼을 두 번 고르면 열이 중복됨
+            result.append(hit)
     return result
 
 
@@ -198,6 +202,7 @@ def preprocess_ams(
     SUFFIXED = {"HP_CompTargetHz": "CompTargetHz[*10]",
                 "HP_FanSpeed": "FanSpeed[/100]",
                 "HP_SuperHeatDegree": "SuperHeatDegree[*10]"}
+    applied = {}   # 실제로 곱한 배율 — Merge 의 변수 표 Weight 와 이중 적용을 막는 데 사용
     for col, factor in scale_factors.items():
         if col not in df.columns:
             continue
@@ -205,8 +210,10 @@ def preprocess_ams(
         if tag and tag not in raw_cols:
             factor = _infer_ams_scale(df, col, factor, diag)
             if factor == 1.0:
+                applied[col] = 1.0
                 continue
         df[col] = pd.to_numeric(df[col], errors="coerce") * factor
+        applied[col] = float(factor)
 
     if "SubProcess" in df.columns:
         df["SubProcess"] = df["SubProcess"].replace(subprocess_mapping)
@@ -232,6 +239,7 @@ def preprocess_ams(
     for ln in diag:
         print(ln)
     df.attrs["ams_diag"] = diag
+    df.attrs["ams_scale_applied"] = applied
     return df
 
 

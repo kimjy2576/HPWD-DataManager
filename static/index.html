@@ -292,6 +292,7 @@ function MergeTab({cfg,sid,setSid,st,setSt,setTab,setCalcAutoFiles,setViewerAuto
 const[poll,setPoll]=useState(false);const pr=useRef();
 const[varCols,setVarCols]=useState(null);  // 스캔된 컬럼 {col: {source,dtype}}
 const[varSet,setVarSet]=useState({});       // 변수 설정 {col: {include,weight,bias}}
+const[varDefs,setVarDefs]=useState({});     // 스캔 기본값 {col:{weight,bias,rename}} — '리셋' 복원용
 const[varOpen,setVarOpen]=useState(false);  // 패널 접기/펼치기
 const[varFilter,setVarFilter]=useState(''); // 검색 필터
 const[scanning,setScanning]=useState(false);
@@ -343,12 +344,21 @@ const scanVars=async()=>{if(!sid)return;setScanning(true);
     console.warn('[scanVars] 매칭 0건 — 전부 include로 설정');
     csvCols.forEach(c=>{init[c].include=true});
   }
-  setVarSet(init);setVarOpen(true);
+  setVarSet(init);setVarDefs(d.defaults||{});setVarOpen(true);
   console.log('[scanVars] 적용 완료: 저장설정',matchCount,'개 + config',cfgCount,'개');
   }catch(e){alert(e.message)}setScanning(false)};
 
 // 변수 설정 변경
 const setVar=(col,key,val)=>setVarSet(p=>({...p,[col]:{...p[col],[key]:val}}));
+// 이름·Weight·Bias 를 입력하면 그 변수는 자동으로 체크 (체크 안 된 행도 바로 입력 가능)
+const editVar=(col,key,val)=>setVarSet(p=>({...p,[col]:{...p[col],[key]:val,
+  include:(key==='rename'&&val==='')?!!p[col]?.include:true}}));
+// 리셋: 스캔 기본값으로 (AMS 자동 배율 변수는 자동 배율로 돌아감)
+const resetVar=col=>setVarSet(p=>{const d=varDefs[col]||{};
+  return{...p,[col]:{...p[col],weight:d.weight??1.0,bias:d.bias??0.0,rename:d.rename??''}}});
+// Weight/Bias 는 입력한 글자 그대로 보관 ('0.', '-', '0.90' 도 입력 중 지워지지 않게) → 계산할 때만 숫자로.
+// 예전엔 입력마다 숫자로 바꿔서 '0.' 이 0 으로, 빈칸이 0 으로 바뀌어 소수점·음수 입력이 안 되고 Weight 0 이 될 수 있었음
+const numOr=(v,d)=>{if(v===''||v==null)return d;const x=+v;return Number.isFinite(x)?x:d};
 const selectAll=()=>setVarSet(p=>{const n={...p};Object.keys(n).forEach(k=>n[k]={...n[k],include:true});return n});
 const deselectAll=()=>setVarSet(p=>{const n={...p};Object.keys(n).forEach(k=>n[k]={...n[k],include:false});return n});
 const loadRef=useRef(null);
@@ -389,7 +399,8 @@ const loadSettings=e=>{
 
 // Merge 실행 (variable_settings 포함)
 const runMerge=async()=>{if(!sid)return;
-  const vs=varCols?varSet:null;
+  // 소스(BR/AMS/…)를 함께 보내 서버가 어느 전처리에서 이 변수를 남길지 알 수 있게 함
+  const vs=varCols?Object.fromEntries(Object.entries(varSet).map(([k,v])=>[k,varCols[k]?.source?{...v,source:varCols[k].source}:v])):null;
   try{await fetch(`${API}/api/merge`,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({session_id:sid,config:cfg,variable_settings:vs})});setPoll(true)}catch(e){alert(e.message)}};
 
@@ -400,8 +411,9 @@ const filteredVars=varCols?Object.entries(varCols).filter(([c])=>
   !varFilter||c.toLowerCase().includes(varFilter.toLowerCase())):[];
 
 const includedCount=Object.values(varSet).filter(v=>v.include).length;
-const wbCount=Object.values(varSet).filter(v=>v.include&&(v.weight!==1.0||v.bias!==0.0)).length;
-const renameCount=Object.entries(varSet).filter(([k,v])=>v.include&&v.rename&&v.rename!==k).length;
+// 스캔 기본값(AMS 자동 배율 포함)과 다른 것만 사용자 W&B·이름 변경으로 셈
+const wbCount=Object.entries(varSet).filter(([k,v])=>v.include&&(numOr(v.weight,1)!==(varDefs[k]?.weight??1)||numOr(v.bias,0)!==(varDefs[k]?.bias??0))).length;
+const renameCount=Object.entries(varSet).filter(([k,v])=>v.include&&v.rename&&v.rename!==k&&v.rename!==(varDefs[k]?.rename||'')).length;
 
 return(<div>
   <PathSelector sid={sid} setSid={setSid} setSt={setSt}/>
@@ -441,24 +453,35 @@ return(<div>
         <div style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 60px 70px 70px 70px',gap:0,padding:'8px 12px',background:'var(--bg3)',fontSize:11,color:'var(--tx2)',fontWeight:500}}>
           <span></span><span>원본 변수명</span><span>변경 이름</span><span>소스</span><span style={{textAlign:'center'}}>Weight</span><span style={{textAlign:'center'}}>Bias</span><span></span>
         </div>
-        {/* 항목 (최대 300개 표시) */}
+        {/* 항목 — 전부 표시 (예전엔 300개까지만 그려서 AMS+BR 컬럼이 많으면 뒤쪽 변수가 안 보였음) */}
         <div style={{maxHeight:350,overflowY:'auto'}}>
-          {filteredVars.slice(0,300).map(([col,info])=>{
-            const vs=varSet[col]||{include:true,weight:1.0,bias:0.0,rename:''};
-            const isModified=vs.weight!==1.0||vs.bias!==0.0;
+          {filteredVars.map(([col,info])=>{
+            const vs=varSet[col]||{include:false,weight:1.0,bias:0.0,rename:''};
+            const df=varDefs[col]||{};
+            const wN=numOr(vs.weight,1),bN=numOr(vs.bias,0);
+            const isModified=wN!==1||bN!==0;   // 원본 대비 W&B 가 걸려 있음
             const hasRename=vs.rename&&vs.rename!==col;
-            return(<div key={col} style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 60px 70px 70px 70px',gap:0,padding:'5px 12px',borderTop:'1px solid var(--bd)',alignItems:'center',opacity:vs.include?1:.4,fontSize:12}}>
-              <input type="checkbox" checked={vs.include} onChange={e=>setVar(col,'include',e.target.checked)} style={{accentColor:'var(--teal)'}}/>
-              <span style={{fontFamily:'var(--mono)',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:hasRename?'var(--tx3)':'var(--tx)'}} title={col}>{col}</span>
-              <input type="text" value={vs.rename||''} onChange={e=>setVar(col,'rename',e.target.value)} placeholder={col} style={{fontSize:11,padding:'3px 6px',background:hasRename?'rgba(59,130,246,.08)':'var(--bg)',borderColor:hasRename?'rgba(59,130,246,.3)':'var(--bd2)',fontFamily:'var(--mono)'}} disabled={!vs.include}/>
-              <span className={`ft ${info.source==='BR'?'fb':info.source==='AMS'?'fa':'fm'}`}>{info.source}</span>
-              <input type="number" value={vs.weight} step="0.01" onChange={e=>setVar(col,'weight',+e.target.value)} style={{width:60,fontSize:11,padding:'3px 5px',textAlign:'center',background:isModified?'rgba(20,184,166,.08)':'var(--bg)'}} disabled={!vs.include}/>
-              <input type="number" value={vs.bias} step="0.1" onChange={e=>setVar(col,'bias',+e.target.value)} style={{width:60,fontSize:11,padding:'3px 5px',textAlign:'center',background:isModified?'rgba(20,184,166,.08)':'var(--bg)'}} disabled={!vs.include}/>
-              <button className="bt bs" style={{padding:'2px 6px',fontSize:10}} onClick={()=>{setVar(col,'weight',1.0);setVar(col,'bias',0.0);setVar(col,'rename','')}} disabled={!isModified&&!hasRename}>리셋</button>
+            const canReset=numOr(vs.weight,1)!==(df.weight??1)||numOr(vs.bias,0)!==(df.bias??0)||(vs.rename||'')!==(df.rename??'');
+            const auto=info.auto_scale!=null;
+            const autoTip=!auto?'':info.auto_mode==='infer'
+              ?'로거 배율 표기가 없는 컬럼 — Merge 때 데이터로 배율을 자동 판정합니다.\nWeight를 바꾸면 자동 판정 대신 원본 × Weight 로 고정됩니다.'
+              :`로거 배율 ×${info.auto_scale} 가 자동 적용됩니다 (Setting → AMS 배율).\nWeight를 바꾸면 원본 × Weight 로 적용됩니다 (이중 적용 안 됨).`;
+            const dim=vs.include?1:.45;
+            return(<div key={col} style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 60px 70px 70px 70px',gap:0,padding:'5px 12px',borderTop:'1px solid var(--bd)',alignItems:'center',fontSize:12}}>
+              <input type="checkbox" checked={!!vs.include} onChange={e=>setVar(col,'include',e.target.checked)} style={{accentColor:'var(--teal)'}}/>
+              <span style={{fontFamily:'var(--mono)',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:hasRename?'var(--tx3)':'var(--tx)',opacity:dim,cursor:'pointer'}} title={col+(vs.include?'':'\n(클릭하면 체크)')} onClick={()=>!vs.include&&setVar(col,'include',true)}>{col}</span>
+              <input type="text" value={vs.rename||''} onChange={e=>editVar(col,'rename',e.target.value)} placeholder={info.std||col} title="입력하면 자동으로 체크됩니다" style={{fontSize:11,padding:'3px 6px',background:hasRename?'rgba(59,130,246,.08)':'var(--bg)',borderColor:hasRename?'rgba(59,130,246,.3)':'var(--bd2)',fontFamily:'var(--mono)',opacity:vs.include?1:.7}}/>
+              <span style={{display:'flex',flexDirection:'column',alignItems:'flex-start',gap:1,opacity:dim}}>
+                <span className={`ft ${info.source==='BR'?'fb':info.source==='AMS'?'fa':'fm'}`}>{info.source}</span>
+                {auto&&<span title={autoTip} style={{fontSize:9,color:'var(--teal)',cursor:'help',whiteSpace:'nowrap'}}>{info.auto_mode==='infer'?'자동 판정':`자동 ×${info.auto_scale}`}</span>}
+              </span>
+              <input type="text" inputMode="decimal" value={vs.weight??''} onChange={e=>editVar(col,'weight',e.target.value)} title={autoTip||'출력 = 원본 × Weight + Bias'} style={{width:60,fontSize:11,padding:'3px 5px',textAlign:'center',background:isModified?'rgba(20,184,166,.08)':'var(--bg)',opacity:vs.include?1:.7}}/>
+              <input type="text" inputMode="decimal" value={vs.bias??''} onChange={e=>editVar(col,'bias',e.target.value)} style={{width:60,fontSize:11,padding:'3px 5px',textAlign:'center',background:isModified?'rgba(20,184,166,.08)':'var(--bg)',opacity:vs.include?1:.7}}/>
+              <button className="bt bs" style={{padding:'2px 6px',fontSize:10}} onClick={()=>resetVar(col)} disabled={!canReset} title="스캔 기본값으로 되돌리기">리셋</button>
             </div>)})}
         </div>
       </div>
-      <div className="it" style={{marginTop:8}}>수식: 출력 = 원본 × Weight + Bias / 변경 이름이 있으면 해당 이름으로 출력됩니다</div>
+      <div className="it" style={{marginTop:8}}>수식: 출력 = 원본 × Weight + Bias / 변경 이름이 있으면 해당 이름으로 출력됩니다 / 체크 안 된 변수도 이름·Weight를 입력하면 자동 체크 / <span style={{color:'var(--teal)'}}>자동</span> = 로거 배율이 자동 적용되는 AMS 변수 (Weight를 바꾸면 원본 × Weight)</div>
     </div>}
   </div>}
 

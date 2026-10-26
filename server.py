@@ -201,10 +201,37 @@ def _dedupe_names(names):
     return out
 
 
-def read_source_csv(path, file_rules, src_key, default_skip=1):
+# 배율 표기('[*10]','[/100]')가 없는 로거 버전에서 전처리가 데이터로 배율을 판정하는 AMS 컬럼
+_AMS_INFERABLE = ("HP_CompTargetHz", "HP_FanSpeed", "HP_SuperHeatDegree")
+
+
+def _ams_default_weight(raw_col: str, std_col: str, scale_factors: dict) -> float:
+    """변수 스캔 표의 AMS 기본 Weight = 전처리가 자동으로 적용하는 로거 배율.
+
+    표기 없는 변형 컬럼(_AMS_INFERABLE)은 Merge 때 데이터로 판정하므로 1.0 으로 표시.
+    _apply_variable_settings 는 표의 Weight 가 이 값과 같으면 '자동 배율 유지'로 본다.
+    """
+    w = float((scale_factors or {}).get(std_col, 1.0))
+    if std_col in _AMS_INFERABLE and "[" not in str(raw_col):
+        w = 1.0
+    return w
+
+
+def _num_or(v, default):
+    """표에서 온 숫자(빈칸·None·문자 가능)를 float 로. 해석 불가면 기본값."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return x if np.isfinite(x) else default
+
+
+def read_source_csv(path, file_rules, src_key, default_skip=1, nrows=None):
     """csv/tsv 읽기 — 인코딩 폴백 + 헤더 행 자동 탐지 + 레이아웃 보정.
 
-    앱(Merge)과 진단 도구(tools/diagnose.py)가 같은 경로를 쓰도록 모듈 수준에 둠.
+    앱(Merge)·변수 스캔·진단 도구(tools/diagnose.py)가 같은 경로를 쓰도록 모듈 수준에 둠.
+    (스캔이 따로 읽으면 BOM·헤더 행·쉼표 헤더 처리 차이로 변수명이 Merge 와 달라짐)
+    nrows: 앞쪽 일부 행만 읽기 (변수 스캔용)
     """
     sep = '\t' if path.lower().endswith('.tsv') else ','
     skip = (file_rules or {}).get(src_key, {}).get("skip_rows", default_skip)
@@ -271,6 +298,8 @@ def read_source_csv(path, file_rules, src_key, default_skip=1):
             print(msg); _READ_NOTES.append(msg)
         kw = dict(encoding=enc, sep=sep, header=None, names=names,
                   skiprows=sk + 1, index_col=False, encoding_errors="replace")
+        if nrows:
+            kw["nrows"] = nrows
         try:
             return pd.read_csv(path, low_memory=False, **kw)
         except Exception as e_fast:
@@ -280,6 +309,8 @@ def read_source_csv(path, file_rules, src_key, default_skip=1):
                 bad.append(len(row))
                 return row[:len(names)]
             df_ = pd.read_csv(path, engine="python", on_bad_lines=_cut, **kw)
+            if nrows:
+                return df_   # 스캔용 부분 읽기 — 전체 파일 칸 수 집계는 생략
             # python 파서는 index_col=False 일 때 초과 칸을 콜백 없이 잘라버려 직접 셈 (느린 경로에서만 실행)
             import csv as _csv
             from collections import Counter as _C
@@ -748,21 +779,18 @@ def scan_columns(req: BrowseRequest):
         cf = _classify_files(case_dir, fr, active)
 
         def _scan_csv(src_key, label, skip=1):
+            # Merge 와 같은 읽기 함수 사용 → 표에 보이는 이름 = merged 파일 컬럼 이름
+            # (예전엔 따로 읽어서 BOM 붙은 'Time', 헤더 행 자동 조정, 쉼표 포함 헤더가 Merge 와 달랐음)
             for fp_name in cf.get(src_key, []):
                 fp = case_dir / fp_name
-                rule = fr.get(src_key, {})
-                skip_r = rule.get("skip_rows", skip)
-                sep = '\t' if fp.suffix.lower() == '.tsv' else ','
-                for enc in ["utf-8", "cp949", "euc-kr", "latin1"]:
-                    try:
-                        skiparg = list(range(skip_r)) if skip_r > 0 else None
-                        df = pd.read_csv(fp, encoding=enc, sep=sep, skiprows=skiparg, nrows=5)
-                        df.columns = [c.strip() for c in df.columns]
-                        for c in df.columns:
-                            if c not in all_columns:
-                                all_columns[c] = {"source": label, "dtype": str(df[c].dtype)}
-                        break
-                    except: continue
+                try:
+                    df = read_source_csv(str(fp), fr, src_key, skip, nrows=5)
+                except Exception as e:
+                    print(f"  [scan] {fp_name} 읽기 실패: {type(e).__name__}: {e}")
+                    continue
+                for c in df.columns:
+                    if c not in all_columns:
+                        all_columns[c] = {"source": label, "dtype": str(df[c].dtype)}
 
         _scan_csv("br", "BR", skip=1)
         _scan_csv("ams", "AMS", skip=1)
@@ -802,10 +830,7 @@ def scan_columns(req: BrowseRequest):
                 if raw_col not in all_columns:
                     continue
                 # 배율 표기('[*10]','[/100]')가 없는 변형 컬럼은 전처리가 자동 판정하므로 1.0 표시
-                _w = float(sf.get(std_col, 1.0))
-                if std_col in ("HP_CompTargetHz", "HP_FanSpeed", "HP_SuperHeatDegree") \
-                        and "[" not in raw_col:
-                    _w = 1.0
+                _w = _ams_default_weight(raw_col, std_col, sf) if src == "ams" else float(sf.get(std_col, 1.0))
                 defaults[raw_col] = {
                     "include": True,
                     "rename": std_col if std_col != raw_col else "",
@@ -827,6 +852,22 @@ def scan_columns(req: BrowseRequest):
     for t in ("Time", "Time_sec", "Time_min"):
         if t in all_columns:
             defaults[t] = {"include": True, "rename": "", "weight": 1.0, "bias": 0.0}
+    # AMS 컬럼 표시 정보: 표준명(전처리 후 이름), 로거 배율 자동 적용 여부
+    try:
+        ams_map = (DEFAULT_CFG.get("column_mappings", {}) or {}).get("ams", {}) or {}
+        sf_ams = DEFAULT_CFG.get("ams_scale_factors", {}) or {}
+        for c, info in all_columns.items():
+            if info.get("source") != "AMS":
+                continue
+            std = ams_map.get(c, c)
+            if std != c:
+                info["std"] = std
+            if std in sf_ams:
+                info["auto_scale"] = _ams_default_weight(c, std, sf_ams)
+                info["auto_mode"] = "infer" if (std in _AMS_INFERABLE and "[" not in c) else "fixed"
+    except Exception as e:
+        print(f"  [scan] AMS 표시 정보 생성 실패: {e}")
+    _READ_NOTES.clear()   # 스캔 중 읽기 메모는 Merge 로그와 무관
     print(f"  [scan] 컬럼 {len(all_columns)}개, config 기본 체크 {len(defaults)}개")
 
     return {
@@ -878,15 +919,37 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
         use_ni = "NIDAQ" in sources
         _log(sid, f"  사용 소스: {', '.join(sources)} / 기준 시간축: {dt}")
 
-        # 변수 설정 로그
+        # ── 전처리에서 남길 컬럼 = Setting 기본 목록(selected_columns) ∪ 변수 표에서 체크한 변수 ──
+        # 예전에는 BR/AMS 전처리가 Setting 기본 목록으로 먼저 걸러서, 표에서 새로 체크한 변수는
+        # _apply_variable_settings 에 도달하기 전에 이미 빠져 있었다 (체크해도 merged 에 없음).
+        sel_br = list(get_selected_columns(cfg, "br"))
+        sel_ams = list(get_selected_columns(cfg, "ams"))
+        extras = []   # Setting 기본 목록 밖에서 표로 추가한 변수 (원본 이름)
         if var_settings:
-            included = [k for k, v in var_settings.items() if v.get("include", True)]
-            excluded = [k for k, v in var_settings.items() if not v.get("include", True)]
-            wb_applied = [k for k, v in var_settings.items()
-                         if v.get("include", True) and (v.get("weight", 1.0) != 1.0 or v.get("bias", 0.0) != 0.0)]
-            renamed = [k for k, v in var_settings.items()
-                       if v.get("include", True) and v.get("rename") and v.get("rename") != k]
-            _log(sid, f"  변수 설정: {len(included)}개 포함, {len(excluded)}개 제외, {len(wb_applied)}개 W&B, {len(renamed)}개 이름변경")
+            _nm = lambda x: str(x).strip().replace(" ", "_").lower()
+            cm_ams = get_column_mapping(cfg, "ams") or {}
+            cm_br = get_column_mapping(cfg, "blackrose") or {}
+            have = {"BR": {_nm(c) for c in sel_br}, "AMS": {_nm(c) for c in sel_ams}}
+            for key, v in var_settings.items():
+                if not (v or {}).get("include", True) or key in ("Time", "LogTime", "Time_sec", "Time_min"):
+                    continue
+                src = (v or {}).get("source")      # 화면이 보낸 소스 (없으면 양쪽 모두 시도)
+                added = False
+                for s_name, cmap, sel in (("AMS", cm_ams, sel_ams), ("BR", cm_br, sel_br)):
+                    if src not in (None, s_name):
+                        continue
+                    std = cmap.get(key, key)        # 전처리에서 바뀐 뒤의 이름
+                    if _nm(std) not in have[s_name]:
+                        sel.append(std)
+                        have[s_name].add(_nm(std))
+                        added = True
+                if added:
+                    extras.append(key)
+            included = [k for k, v in var_settings.items() if (v or {}).get("include", True)]
+            _log(sid, f"  변수 설정: {len(included)}개 포함, {len(var_settings) - len(included)}개 제외")
+            if extras:
+                _log(sid, f"  ➕ Setting 기본 목록 밖 추가 변수 {len(extras)}개: "
+                          f"{', '.join(extras[:12])}{' …' if len(extras) > 12 else ''}")
 
         ref_map = {"BR":"br","AMS":"ams","MX100":"mx100","NIDAQ":"nidaq"}
 
@@ -940,7 +1003,7 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 # 선택된 소스만 전처리
                 if use_br and not df_br.empty:
                     df_br_main, df_br_add = preprocess_blackrose(
-                        df_br, get_selected_columns(cfg, "br"), get_column_mapping(cfg, "blackrose"))
+                        df_br, sel_br, get_column_mapping(cfg, "blackrose"))
                 else:
                     df_br_main, df_br_add = pd.DataFrame(), pd.DataFrame()
 
@@ -948,9 +1011,13 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                     df_ams_proc = preprocess_ams(
                         df_ams, get_column_mapping(cfg, "ams"),
                         cfg.get("ams_scale_factors", {}), cfg.get("subprocess_mapping", {}),
-                        get_selected_columns(cfg, "ams"))
+                        sel_ams)
                 else:
                     df_ams_proc = pd.DataFrame()
+                # 전처리가 실제로 적용한 AMS 로거 배율 (표의 Weight 와 이중 적용 방지용)
+                ams_applied = dict(df_ams_proc.attrs.get("ams_scale_applied", {})) if not df_ams_proc.empty else {}
+                present = {n for n, d in (("BR", df_br), ("AMS", df_ams), ("MX100", df_mx), ("NIDAQ", df_ni))
+                           if not d.empty}
                 # [ams] 진단은 preprocess_ams 의 print() 로 이미 로그에 전달됨
 
                 if use_mx and not df_mx.empty:
@@ -1029,9 +1096,26 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 merged = run_postprocessing(merged, cfg)
                 _log(sid, f"  🔧 후처리: {time.perf_counter()-t1:.1f}s")
 
-                # ── 변수 설정 적용 (W&B + 포함/제외) ──
+                # ── 변수 설정 적용 (W&B + 포함/제외 + 이름 변경) ──
                 if var_settings:
-                    merged = _apply_variable_settings(merged, var_settings)
+                    rep = {}
+                    merged = _apply_variable_settings(
+                        merged, var_settings, cfg=cfg, ams_applied=ams_applied,
+                        log=lambda m: _log(sid, m), report=rep)
+                    # 표에서 추가한 변수가 실제로 들어갔는지 확인 (조용히 빠지는 일이 없도록)
+                    if extras:
+                        fin = rep.get("final", {})
+                        ok = [fin[k] for k in extras if fin.get(k) in merged.columns]
+                        miss = [k for k in extras if fin.get(k) not in merged.columns
+                                and (var_settings[k] or {}).get("source") in present]
+                        empty = [c for c in ok if merged[c].isna().all()]
+                        _log(sid, f"  ➕ 추가 변수 {len(ok)}/{len(extras)}개 포함"
+                                  + (f" ({', '.join(ok[:10])}{' …' if len(ok) > 10 else ''})" if ok else ""))
+                        if miss:
+                            _log(sid, f"  ⚠️ 체크했지만 이 케이스 파일에 없는 변수 {len(miss)}개: {', '.join(miss[:10])}")
+                        if empty:
+                            _log(sid, f"  ⚠️ 값이 전부 비어 있는 추가 변수: {', '.join(empty[:10])} "
+                                      f"(문자 값은 숫자로 바뀌지 않아 빈 값이 됨)")
 
                 # _merged.csv 저장 (한번 쓰고 복사)
                 t1 = time.perf_counter()
@@ -1073,52 +1157,118 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
         _log(sid, f"에러: {e}\n{traceback.format_exc()}")
 
 
-def _apply_variable_settings(df: pd.DataFrame, var_settings: dict) -> pd.DataFrame:
+def _apply_variable_settings(df: pd.DataFrame, var_settings: dict, cfg: dict | None = None,
+                             ams_applied: dict | None = None, log=None,
+                             report: dict | None = None) -> pd.DataFrame:
     """
-    변수별 Weight & Bias 적용 + 이름 변경 + 제외 컬럼 삭제.
-    공백/언더스코어를 동일시하여 매칭.
+    변수 표 설정 적용: Weight & Bias → 제외 컬럼 삭제 → 이름 변경.
+
+    · 표의 키는 '변수 스캔'에 보이는 원본 이름. column_mappings 에 있는 AMS/BR 원본은
+      전처리에서 이미 표준명으로 바뀌었으므로(예: DryFtemp → HP_F_Temp) 매핑을 따라가 찾는다.
+      (예전엔 원본 이름으로만 찾아서 기본 AMS 변수의 Weight·체크 해제·이름 변경이 조용히 무시됨)
+    · Weight 는 '원본 값에 곱하는 총 배율' (출력 = 원본 × Weight + Bias).
+      전처리가 로거 배율(ams_scale_factors)을 이미 적용한 AMS 컬럼은
+        - 표의 Weight 가 스캔 기본값(_ams_default_weight)과 같으면 → 자동 배율 그대로 (추가 곱셈 없음)
+        - 다르면 → 이미 곱해진 배율을 나눠 결과가 원본 × Weight 가 되게 함 (이중 적용 방지)
+    · 같은 컬럼을 가리키는 설정이 여럿이면(BR·AMS 에 같은 변수) 하나라도 포함이면 유지,
+      W&B·이름 변경은 처음 한 번만.
+    report: 주어지면 {"final": {설정 키: 최종 컬럼명}} 을 채움
     """
-    # 퍼지 매칭 맵: 설정 키 → 실제 컬럼명
-    norm = lambda s: s.strip().replace(" ", "_").lower()
+    cfg = cfg or {}
+    say = log or print
+    cm = cfg.get("column_mappings", {}) or {}
+    ams_map = cm.get("ams", {}) or {}
+    br_map = cm.get("blackrose", {}) or {}
+    sf = cfg.get("ams_scale_factors", {}) or {}
+    ams_applied = ams_applied or {}
+
+    norm = lambda x: str(x).strip().replace(" ", "_").lower()
     col_map = {norm(c): c for c in df.columns}
-    def resolve(key):
-        if key in df.columns: return key
-        return col_map.get(norm(key))
 
-    # 1. W&B 적용 (include=True인 것만)
-    for col, s in var_settings.items():
-        actual = resolve(col)
-        if not actual: continue
-        if not s.get("include", True): continue
-        w = s.get("weight", 1.0)
-        b = s.get("bias", 0.0)
-        if w != 1.0 or b != 0.0:
-            if pd.api.types.is_numeric_dtype(df[actual]):
-                df[actual] = df[actual] * w + b
+    def _find(name):
+        if name in df.columns:
+            return name
+        return col_map.get(norm(name))
 
-    # 2. 이름 변경
-    rename_map = {}
-    for col, s in var_settings.items():
-        actual = resolve(col)
-        if not actual: continue
-        if not s.get("include", True): continue
-        rn = s.get("rename", "")
-        if rn and rn != actual and rn not in df.columns:
-            rename_map[actual] = rn
-    if rename_map:
-        df = df.rename(columns=rename_map)
+    def std_of(key, src):
+        if src == "AMS":
+            return ams_map.get(key, key)
+        if src == "BR":
+            return br_map.get(key, key)
+        if src in ("MX100", "NIDAQ"):
+            return key
+        return ams_map.get(key) or br_map.get(key) or key
 
-    # 3. 제외 컬럼 삭제 (Time, Time_sec, Time_min은 항상 유지)
     protected = {"Time", "Time_sec", "Time_min"}
-    drop_cols = []
-    for col, s in var_settings.items():
-        actual = resolve(col)
-        if not actual: continue
-        if not s.get("include", True) and actual not in protected:
-            drop_cols.append(actual)
-    if drop_cols:
-        df = df.drop(columns=drop_cols, errors="ignore")
+    keep, drop, wb_done, renames, final = set(), [], set(), {}, {}
+    wb_log, rn_log = [], []
 
+    for key, s in var_settings.items():
+        s = s or {}
+        src = s.get("source")
+        std = std_of(key, src)
+        actual = _find(key) or _find(std)
+        if not actual:
+            continue
+        if not s.get("include", True):
+            drop.append(actual)
+            continue
+        keep.add(actual)
+        final[key] = actual
+
+        # ── Weight & Bias ──
+        w = _num_or(s.get("weight"), 1.0)
+        b = _num_or(s.get("bias"), 0.0)
+        is_ams_key = src == "AMS" or (src is None and key in ams_map)
+        f = 1.0
+        if is_ams_key and std in sf:
+            dw = _ams_default_weight(key, std, sf)
+            f = _num_or(ams_applied.get(std), 1.0) or 1.0
+            mult = 1.0 if abs(w - dw) <= 1e-9 * max(1.0, abs(dw)) else w / f
+        else:
+            mult = w
+        if (mult != 1.0 or b != 0.0) and actual not in wb_done:
+            if pd.api.types.is_numeric_dtype(df[actual]):
+                df[actual] = df[actual] * mult + b
+                wb_done.add(actual)
+                desc = f"원본×{w:g}" + (f" (자동 ×{f:g} 대신)" if f != 1.0 and mult != 1.0 else "") \
+                    if mult != 1.0 else ""
+                desc += (" " if desc else "") + (f"{b:+g}" if b else "")
+                wb_log.append(f"{actual} {desc.strip()}")
+            else:
+                say(f"  [변수] ⚠️ {actual}: 숫자 컬럼이 아니라 Weight/Bias 미적용")
+
+        # ── 이름 변경 ──
+        rn = str(s.get("rename") or "").strip()
+        if rn and rn != actual and actual not in renames:
+            if rn in df.columns or rn in renames.values():
+                # 계산 단계가 같은 값으로 이미 만든 표준명 별칭(예: Heatpump_DuctInTemp → T_Air_Eva_In)이면
+                # 목적이 이미 이뤄진 것 → 조용히 넘어감. 값이 다를 때만 경고.
+                same = False
+                if rn in df.columns:
+                    a_ = pd.to_numeric(df[rn], errors="coerce")
+                    b_ = pd.to_numeric(df[actual], errors="coerce")
+                    same = bool(((a_ - b_).abs() <= 1e-9 * (1 + b_.abs())).where(b_.notna(), a_.isna()).all())
+                if not same:
+                    say(f"  [변수] ⚠️ {key}: 변경 이름 '{rn}' 이 값이 다른 기존 컬럼과 겹쳐 이름 변경 안 함")
+            else:
+                renames[actual] = rn
+                rn_log.append(f"{actual}→{rn}")
+
+    drop = [c for c in dict.fromkeys(drop) if c not in keep and c not in protected]
+    if drop:
+        df = df.drop(columns=drop, errors="ignore")
+    if renames:
+        df = df.rename(columns=renames)
+    if report is not None:
+        report["final"] = {k: renames.get(a, a) for k, a in final.items()}
+
+    if wb_log:
+        say(f"  [변수] Weight/Bias 적용 {len(wb_log)}개: {', '.join(wb_log[:12])}{' …' if len(wb_log) > 12 else ''}")
+    if rn_log:
+        say(f"  [변수] 이름 변경 {len(rn_log)}개: {', '.join(rn_log[:12])}{' …' if len(rn_log) > 12 else ''}")
+    if drop:
+        say(f"  [변수] 체크 해제로 제외 {len(drop)}개")
     return df
 
 
