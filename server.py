@@ -427,6 +427,134 @@ def _lookup_source(out_name):
             return Path(data[key])
     return None
 
+
+# ══════════════════════════════════════════════
+#  results 폴더 트리 — 하위 폴더(= Visualization 의 폴더) 지원
+#  파일은 지금처럼 '파일 이름'으로 주고받고, 서버가 results 아래 실제 위치를 찾는다.
+#  그래서 파일을 하위 폴더로 옮겨도 Merge·Calc·Viewer·Formula 가 그대로 동작한다.
+#  같은 이름의 결과 파일은 results 전체에서 하나만 둔다 (이동·이름 변경 때 검사).
+# ══════════════════════════════════════════════
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                 *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+_BAD_NAME_CHARS = set('<>:"/\\|?*')
+
+
+def _check_name(name, what="이름"):
+    """Windows 에서도 쓸 수 있는 파일·폴더 이름인지 검사 → 정리된 이름. 문제 있으면 HTTP 400."""
+    n = str(name or "").strip().rstrip(". ")
+    if not n:
+        raise HTTPException(400, f"{what}이 비어 있습니다")
+    bad = sorted({c for c in n if c in _BAD_NAME_CHARS or ord(c) < 32})
+    if bad:
+        raise HTTPException(400, f"{what}에 쓸 수 없는 문자가 있습니다: {' '.join(bad)}  "
+                                 f"(\\ / : * ? \" < > | 는 사용할 수 없음)")
+    if n in (".", "..") or n.split(".")[0].strip().upper() in _WIN_RESERVED:
+        raise HTTPException(400, f"'{n}' 은(는) Windows 예약어라 {what}으로 쓸 수 없습니다 "
+                                 f"(CON, PRN, AUX, NUL, COM1~9, LPT1~9)")
+    if len(n) > 150:
+        raise HTTPException(400, f"{what}이 너무 깁니다 ({len(n)}자, 최대 150자)")
+    return n
+
+
+def _same_name(a, b):
+    return a.lower() == b.lower() if os.name == "nt" else a == b
+
+
+def _samefile(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except Exception:
+        return False
+
+
+def _hidden_dir(part):
+    """'.' 숨김 폴더, '_' 프로그램용 폴더(_diagnose 등)는 결과 폴더로 보지 않음."""
+    return part.startswith((".", "_"))
+
+
+def _iter_results():
+    """results 아래 모든 결과 CSV (하위 폴더 포함, 숨김·프로그램용 폴더 제외)."""
+    for q in RESULT_DIR.rglob("*.csv"):
+        try:
+            rel = q.relative_to(RESULT_DIR)
+            if q.is_file() and not any(_hidden_dir(part) for part in rel.parts[:-1]):
+                yield q
+        except Exception:
+            continue
+
+
+def _res_find(name):
+    """파일 이름 → results 트리 안의 실제 위치 (루트 우선, 없으면 하위 폴더). 없으면 None."""
+    name = Path(str(name or "").replace("\\", "/")).name
+    if not name:
+        return None
+    p = RESULT_DIR / name
+    if p.is_file():
+        return p
+    hits = [q for q in _iter_results() if _same_name(q.name, name)]
+    if not hits:
+        return None
+    hits.sort(key=lambda q: q.stat().st_mtime, reverse=True)
+    return hits[0]
+
+
+def _res_file(name):
+    """읽기용 위치. 없으면 404."""
+    p = _res_find(name)
+    if p is None:
+        raise HTTPException(404, f"파일 없음: {name}")
+    return p
+
+
+def _res_target(name, near=None):
+    """쓰기용 위치: 같은 이름 파일이 이미 있으면 그 자리(사용자가 옮긴 폴더 유지),
+    없으면 near(관련 파일)와 같은 폴더, 그것도 없으면 results 루트."""
+    name = Path(str(name)).name
+    hit = _res_find(name)
+    if hit is not None:
+        return hit
+    if near is not None:
+        return Path(near).parent / name
+    return RESULT_DIR / name
+
+
+def _res_folder_of(p):
+    rel = Path(p).parent.relative_to(RESULT_DIR).as_posix()
+    return "" if rel == "." else rel
+
+
+def _res_folder_path(folder):
+    """'A' 또는 'A/B' → results 안의 실제 경로. 각 단계 이름을 검사해 results 밖으로 못 나가게 함."""
+    folder = str(folder or "").strip().replace("\\", "/").strip("/")
+    if not folder:
+        return RESULT_DIR
+    return RESULT_DIR.joinpath(*[_check_name(x, "폴더 이름") for x in folder.split("/")])
+
+
+def _sources_load():
+    import json
+    meta = RESULT_DIR / "_sources.json"
+    if meta.exists():
+        try:
+            return json.loads(meta.read_text("utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _sources_save(data):
+    import json
+    try:
+        (RESULT_DIR / "_sources.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+        return True
+    except Exception as e:
+        print(f"  [sources] 기록 실패: {e}")
+        return False
+
+
+_IN_USE_MSG = "다른 프로그램(엑셀·탐색기 등)이 사용 중이라 바꾸지 못했습니다. 닫고 다시 시도하세요"
+
+
 sessions: dict[str, dict] = {}
 DEFAULT_CFG = load_config()
 
@@ -1122,7 +1250,7 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 parts = case_name.split("_")[:9]
                 prefix = "_".join(parts)
                 out_name = f"{prefix}_{i+1}_merged.csv"
-                result_path = RESULT_DIR / out_name
+                result_path = _res_target(out_name)   # 같은 이름이 하위 폴더에 있으면 그 자리에 덮어씀
 
                 if not _save_csv_verified(merged, result_path, sid, "결과 폴더"):
                     raise IOError(f"결과 저장 실패: {result_path}")
@@ -1303,7 +1431,7 @@ def import_merged(req: ImportRequest):
         dest_name = p.name
         if req.add_merged_suffix and "_merged" not in dest_name and "_calc" not in dest_name:
             dest_name = p.stem + "_merged.csv"
-        dest = RESULT_DIR / dest_name
+        dest = _res_target(dest_name)
         try:
             shutil.copy2(str(p), str(dest))
             imported.append(dest_name)
@@ -1418,8 +1546,8 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
             _log(sid, f"[{i+1}/{total}] {fn} 계산 중...")
 
             # merged CSV 읽기
-            src_path = RESULT_DIR / fn
-            if not src_path.exists():
+            src_path = _res_find(fn)
+            if src_path is None:
                 _log(sid, f"  [경고] 파일 없음: {fn}, 스킵")
                 continue
             df = pd.read_csv(src_path)
@@ -1482,7 +1610,7 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
 
             # _calc.csv 저장
             out_name = fn.replace("_merged.csv", "_calc.csv")
-            calc_path = RESULT_DIR / out_name
+            calc_path = _res_target(out_name, near=src_path)   # merged 와 같은 폴더에
             if not _save_csv_verified(df_calc, calc_path, sid, "결과 폴더"):
                 raise IOError(f"결과 저장 실패: {calc_path}")
 
@@ -1553,8 +1681,7 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
 @app.get("/api/columns/{fn}")
 def get_columns(fn: str):
     """merged CSV의 컬럼 목록 반환 (Calc 변수 매핑 UI용)."""
-    p = RESULT_DIR / fn
-    if not p.exists(): raise HTTPException(404, f"파일 없음: {fn}")
+    p = _res_file(fn)
     df = pd.read_csv(p, nrows=1)
     return {
         "filename": fn,
@@ -1611,8 +1738,7 @@ def auto_map(req: BrowseRequest):
     exact match → default_match 순서로 탐색.
     """
     fn = req.path
-    p = RESULT_DIR / fn
-    if not p.exists(): raise HTTPException(404, f"파일 없음: {fn}")
+    p = _res_file(fn)
     df = pd.read_csv(p, nrows=1)
     merged_cols = df.columns.tolist()
 
@@ -1737,26 +1863,218 @@ def get_status(sid: str):
 
 @app.get("/api/results")
 def list_results():
-    import json
-    files = sorted(RESULT_DIR.glob("*.csv"), key=os.path.getmtime, reverse=True)
-    # 출처 메타데이터
-    meta_path = RESULT_DIR / "_sources.json"
-    sources = {}
-    if meta_path.exists():
-        try: sources = json.loads(meta_path.read_text("utf-8"))
-        except: pass
-    return [{"name": f.name, "size": f.stat().st_size,
-             "type": "merged" if "_merged" in f.name else "formula" if "_formula" in f.name else "calc" if "_calc" in f.name else "other",
-             "source_dir": sources.get(f.name, "")}
-            for f in files]
+    """results 아래 결과 CSV 목록 (하위 폴더 포함). folder: 하위 폴더 ('' = results 바로 아래)."""
+    sources = _sources_load()
+    files = sorted(_iter_results(), key=os.path.getmtime, reverse=True)
+    seen = {}
+    for f in files:
+        k = f.name.lower() if os.name == "nt" else f.name
+        seen[k] = seen.get(k, 0) + 1
+    out = []
+    for f in files:
+        k = f.name.lower() if os.name == "nt" else f.name
+        out.append({"name": f.name, "size": f.stat().st_size,
+                    "type": "merged" if "_merged" in f.name else "formula" if "_formula" in f.name
+                            else "calc" if "_calc" in f.name else "other",
+                    "source_dir": sources.get(f.name, ""),
+                    "folder": _res_folder_of(f),
+                    "dup": seen[k] > 1})   # 같은 이름이 다른 폴더에도 있음 (탐색기로 복사한 경우 등)
+    return out
+
+
+# ── 결과 폴더 관리 (Visualization 폴더 = results 의 실제 하위 폴더) ──
+class ResFolderReq(BaseModel):
+    name: str
+    new_name: Optional[str] = None
+
+
+class ResMoveReq(BaseModel):
+    names: list[str]
+    folder: str = ""
+
+
+class ResRenameReq(BaseModel):
+    renames: list[dict]          # [{"old": "A_1_merged.csv", "new": "B_merged.csv"}, ...]
+    also_source: bool = True     # 원본 케이스 폴더에 있는 사본도 같이 이름 변경
+
+
+@app.get("/api/result-folders")
+def list_result_folders():
+    folders = []
+    for d in RESULT_DIR.rglob("*"):
+        try:
+            rel = d.relative_to(RESULT_DIR)
+            if d.is_dir() and not any(_hidden_dir(part) for part in rel.parts):
+                folders.append(rel.as_posix())
+        except Exception:
+            continue
+    return {"folders": sorted(folders, key=str.lower), "root": str(RESULT_DIR)}
+
+
+def _check_folder_name(name):
+    n = _check_name(name, "폴더 이름")
+    if _hidden_dir(n):
+        raise HTTPException(400, "'_' 나 '.' 으로 시작하는 폴더 이름은 프로그램용이라 쓸 수 없습니다")
+    return n
+
+
+@app.post("/api/result-folders")
+def create_result_folder(req: ResFolderReq):
+    p = RESULT_DIR / _check_folder_name(req.name)   # 한 단계만 ('/' 불가)
+    if p.exists():
+        raise HTTPException(409, f"이미 있는 폴더입니다: {req.name}")
+    p.mkdir(parents=True)
+    return {"folder": p.relative_to(RESULT_DIR).as_posix(), "path": str(p)}
+
+
+@app.post("/api/result-folders/rename")
+def rename_result_folder(req: ResFolderReq):
+    src = _res_folder_path(req.name)
+    if src == RESULT_DIR or not src.is_dir():
+        raise HTTPException(404, f"폴더 없음: {req.name}")
+    dst = src.parent / _check_folder_name(req.new_name)
+    if dst.exists() and not _samefile(src, dst):
+        raise HTTPException(409, f"같은 이름의 폴더가 이미 있습니다: {dst.name}")
+    try:
+        os.rename(src, dst)
+    except PermissionError:
+        raise HTTPException(409, f"폴더 '{src.name}': {_IN_USE_MSG}")
+    return {"folder": dst.relative_to(RESULT_DIR).as_posix(), "path": str(dst)}
+
+
+@app.post("/api/result-folders/delete")
+def delete_result_folder(req: ResFolderReq):
+    """폴더 삭제 — 안의 결과 파일은 지우지 않고 results 바로 아래로 옮긴 뒤 폴더를 없앤다."""
+    import shutil
+    src = _res_folder_path(req.name)
+    if src == RESULT_DIR or not src.is_dir():
+        raise HTTPException(404, f"폴더 없음: {req.name}")
+    csvs = [q for q in src.rglob("*.csv") if q.is_file()]
+    clash = [q.name for q in csvs if (RESULT_DIR / q.name).exists()]
+    if clash:
+        raise HTTPException(409, "results 바로 아래에 같은 이름 파일이 있어 옮길 수 없습니다: "
+                                 + ", ".join(clash[:5]))
+    moved = []
+    for q in csvs:
+        try:
+            shutil.move(str(q), str(RESULT_DIR / q.name))
+            moved.append(q.name)
+        except PermissionError:
+            raise HTTPException(409, f"{q.name}: {_IN_USE_MSG} (이미 옮긴 파일 {len(moved)}개)")
+    left = [x.name for x in src.rglob("*") if x.is_file()]
+    if not left:
+        try:
+            shutil.rmtree(src)
+        except Exception as e:
+            raise HTTPException(409, f"파일은 옮겼지만 폴더를 지우지 못했습니다: {e}")
+    return {"moved": moved, "removed": not left, "left": left[:10]}
+
+
+@app.post("/api/result-files/move")
+def move_result_files(req: ResMoveReq):
+    """결과 파일을 하위 폴더로 이동 (folder='' → results 바로 아래)."""
+    import shutil
+    dst_dir = _res_folder_path(req.folder)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    moved, errors = [], []
+    for name in req.names:
+        src = _res_find(name)
+        if src is None:
+            errors.append(f"{name}: 파일 없음")
+            continue
+        dst = dst_dir / src.name
+        if _samefile(src.parent, dst_dir):
+            continue
+        if dst.exists():
+            errors.append(f"{name}: 대상 폴더에 같은 이름 파일이 있음")
+            continue
+        try:
+            shutil.move(str(src), str(dst))
+            moved.append(src.name)
+        except PermissionError:
+            errors.append(f"{name}: {_IN_USE_MSG}")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    return {"moved": moved, "errors": errors, "folder": _res_folder_of(dst_dir / "x")}
+
+
+@app.post("/api/result-files/rename")
+def rename_result_files(req: ResRenameReq):
+    """결과 파일 이름 변경 (여러 개를 한 번에 — 케이스의 merged·calc·formula 를 같이).
+    전부 검사한 뒤 바꾸고, 중간에 실패하면 이미 바꾼 것을 되돌린다.
+    also_source: 원본 케이스 폴더(_sources.json)에 있는 같은 이름 사본도 이름 변경."""
+    plan = []
+    for r in req.renames:
+        old = Path(str(r.get("old", ""))).name
+        new = _check_name(r.get("new", ""), "파일 이름")
+        if not new.lower().endswith(".csv"):
+            raise HTTPException(400, f"파일 이름은 .csv 로 끝나야 합니다: {new}")
+        src = _res_file(old)
+        if src.name == new:
+            continue
+        plan.append((src.name, new, src))
+    if not plan:
+        return {"renamed": [], "copies": []}
+    news = [n.lower() for _, n, _ in plan]
+    if len(set(news)) != len(news):
+        raise HTTPException(400, "새 이름이 서로 겹칩니다")
+    for old, new, src in plan:
+        hit = _res_find(new)
+        if hit is not None and not _samefile(hit, src):
+            folder = _res_folder_of(hit)
+            raise HTTPException(409, f"같은 이름 파일이 이미 있습니다: {new}"
+                                     + (f" (폴더 '{folder}')" if folder else ""))
+    done = []
+    try:
+        for old, new, src in plan:
+            dst = src.parent / new
+            os.rename(src, dst)
+            done.append((src, dst, old, new))
+    except Exception as e:
+        for a, b, _, _ in reversed(done):
+            try:
+                os.rename(b, a)
+            except Exception:
+                pass
+        if isinstance(e, PermissionError):
+            raise HTTPException(409, f"{old}: {_IN_USE_MSG}")
+        raise HTTPException(500, f"{old}: 이름 변경 실패 — {e}")
+
+    sources = _sources_load()
+    copies = []
+    for _, _, old, new in done:
+        sd = sources.pop(old, None)
+        if sd is None:
+            continue
+        sources[new] = sd
+        if not req.also_source:
+            continue
+        o, n = Path(sd) / old, Path(sd) / new
+        if not o.exists():
+            copies.append({"file": old, "status": "없음", "dir": sd})
+        elif n.exists() and not _samefile(o, n):
+            copies.append({"file": old, "status": "같은 이름 있음", "dir": sd})
+        else:
+            try:
+                os.rename(o, n)
+                copies.append({"file": new, "status": "변경", "dir": sd})
+            except PermissionError:
+                copies.append({"file": old, "status": "사용 중", "dir": sd})
+            except Exception as e:
+                copies.append({"file": old, "status": f"실패: {e}", "dir": sd})
+    _sources_save(sources)
+    for c in copies:
+        print(f"  [rename] 원본 사본 {c['file']}: {c['status']} ({c['dir']})")
+    return {"renamed": [{"old": o, "new": n, "folder": _res_folder_of(d)} for _, d, o, n in done],
+            "copies": copies}
+
 
 @app.get("/api/results/{fn:path}")
 def download(fn: str):
     from urllib.parse import unquote
     fn = unquote(fn)
-    p = RESULT_DIR / fn
-    if not p.exists(): raise HTTPException(404)
-    return FileResponse(p, media_type="text/csv", filename=fn)
+    p = _res_file(fn)
+    return FileResponse(p, media_type="text/csv", filename=p.name)
 
 
 @app.delete("/api/results/{fn:path}")
@@ -1765,9 +2083,12 @@ def delete_result(fn: str):
     import json
     from urllib.parse import unquote
     fn = unquote(fn)
-    p = RESULT_DIR / fn
-    if not p.exists(): raise HTTPException(404, f"파일 없음: {fn}")
-    p.unlink()
+    p = _res_file(fn)
+    try:
+        p.unlink()
+    except PermissionError:
+        raise HTTPException(409, f"{p.name}: {_IN_USE_MSG}")
+    fn = p.name
     # 메타데이터에서도 제거
     meta_path = RESULT_DIR / "_sources.json"
     if meta_path.exists():
@@ -1780,8 +2101,7 @@ def delete_result(fn: str):
 
 @app.get("/api/preview/{fn}")
 def preview(fn: str, max_rows: int = 3000):
-    p = RESULT_DIR / fn
-    if not p.exists(): raise HTTPException(404)
+    p = _res_file(fn)
     df = pd.read_csv(p, nrows=max_rows)
     if "Time" in df.columns: df["Time"] = df["Time"].astype(str)
     df = df.where(pd.notnull(df), None)
@@ -1810,10 +2130,9 @@ def viewer_data(fn: str, max_rows: int = 7200):
     """calc/merged CSV를 컬럼별 배열 JSON으로 반환 (Viewer용)."""
     from urllib.parse import unquote
     fn = unquote(fn)
-    p = RESULT_DIR / fn
-    if not p.exists():
+    p = _res_find(fn)
+    if p is None:
         print(f"  [viewer-data] 404: {fn}, RESULT_DIR={RESULT_DIR}")
-        print(f"  [viewer-data] 존재하는 파일: {[f.name for f in RESULT_DIR.iterdir() if f.is_file()][:10]}")
         raise HTTPException(404, f"파일 없음: {fn}")
     try:
         df = pd.read_csv(p)
@@ -1939,9 +2258,7 @@ def eval_formulas(req: dict):
     if not fn:
         raise HTTPException(400, "filename 필요")
 
-    p = RESULT_DIR / fn
-    if not p.exists():
-        raise HTTPException(404, f"파일 없음: {fn}")
+    p = _res_file(fn)
 
     try:
         df = pd.read_csv(p)
@@ -1967,8 +2284,8 @@ def eval_formulas(req: dict):
             errors.append({"name": name, "error": str(e)})
 
     # 결과 저장
-    out_name = fn.replace(".csv", "_formula.csv")
-    df.to_csv(RESULT_DIR / out_name, index=False)
+    out_name = Path(fn).name.replace(".csv", "_formula.csv")
+    df.to_csv(_res_target(out_name, near=p), index=False)
 
     return {
         "output": out_name,
@@ -1987,9 +2304,7 @@ def preview_formula(req: dict):
     if not fn or not expr:
         raise HTTPException(400, "filename, expr 필요")
 
-    p = RESULT_DIR / fn
-    if not p.exists():
-        raise HTTPException(404, f"파일 없음: {fn}")
+    p = _res_file(fn)
 
     try:
         df = pd.read_csv(p, nrows=100)
@@ -2006,9 +2321,7 @@ def preview_formula(req: dict):
 @app.get("/api/formula-columns/{fn}")
 def formula_columns(fn: str):
     """수식에서 참조할 수 있는 컬럼 목록."""
-    p = RESULT_DIR / fn
-    if not p.exists():
-        raise HTTPException(404)
+    p = _res_file(fn)
     df = pd.read_csv(p, nrows=1)
     return {"columns": df.columns.tolist(), "numeric": df.select_dtypes(include=[np.number]).columns.tolist()}
 
@@ -2152,8 +2465,8 @@ def paths_info():
     import json
     files = []
     try:
-        for f in sorted(RESULT_DIR.glob("*.csv"), key=os.path.getmtime, reverse=True)[:50]:
-            files.append({"name": f.name, "size": f.stat().st_size,
+        for f in sorted(_iter_results(), key=os.path.getmtime, reverse=True)[:50]:
+            files.append({"name": f.name, "folder": _res_folder_of(f), "size": f.stat().st_size,
                           "mtime": f.stat().st_mtime})
     except Exception:
         pass
