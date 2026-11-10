@@ -702,6 +702,8 @@ def _apply_imc_full(df, cfg, props, patm, rh_eva_out,
             perf_corr["water_gm"] = perf_corr["water_gm"] * anchor
         if "water_gs" in perf_corr:
             perf_corr["water_gs"] = perf_corr["water_gs"] * anchor
+        if "SMER" in perf_corr:                 # SMER 도 응축수에 비례 — 앵커링한 응축수로 (P_Dehumidity_PoWD 와 같게)
+            perf_corr["SMER"] = perf_corr["SMER"] * anchor
         # RMC를 앵커링된 water_kg로 재계산 (일관성)
         if exp.get("imc_kg") and exp.get("load_kg"):
             smooth_cfg = (cfg or {}).get("calculation", {}).get("rmc_smoothing") if cfg else None
@@ -845,8 +847,9 @@ def _calc_evaporator_air_and_performance(df, props, patm, rh_eva_out, air_cond, 
     Drum_LFH = np.where(np.abs(Q_drum_sum) > 1e-6, Q_drum_lat / safe_drum, 0)
 
     # SMER [kg/kWh]: 총 전력 대비 제습량
-    # water_gs [g/s] * 3600 / 1000 → [kg/h], Po_WD [W] / 1000 → [kW]
-    SMER = np.where(Po_wd > 0, water_gs * 3.6 / Po_wd, 0)
+    # water_gs [g/s] * 3600 / 1000 → [kg/h], Po_WD [W] / 1000 → [kW]  ⇒  water_gs * 3600 / Po_WD
+    # (전에는 water_gs * 3.6 / Po_WD — kW 로 바꾸지 않아 kg/Wh, 1/1000 로 나왔음)
+    SMER = np.where(Po_wd > 0, water_gs * 3.6 / (Po_wd / 1000.0), 0)
 
     # 풍량 (증발기측)
     v_da_eva = v_moist_air(T_eva_in, AH_eva_in, patm)
@@ -1072,10 +1075,10 @@ def _assemble_output(df, air_cond, ref_cond, ref_eva, ref_comp, flow, perf,
     out["COP_Dry"] = np.where(Po_comp > 0, Q_dry / Po_comp, 0)
     out["COP_sys_Dry"] = np.where(Po_wd > 0, Q_dry / Po_wd, 0)
 
-    # SMER 변형 (제습능력/전력)
+    # SMER 변형 (제습능력/전력) [kg/kWh] — SMER 와 같은 식 (전력 W → kW)
     water_gs = p.get("water_gs", np.zeros(len(df)))
-    out["P_Dehumidity_PoComp"] = np.where(Po_comp > 0, water_gs * 3.6 / Po_comp, 0)
-    out["P_Dehumidity_PoWD"] = np.where(Po_wd > 0, water_gs * 3.6 / Po_wd, 0)
+    out["P_Dehumidity_PoComp"] = np.where(Po_comp > 0, water_gs * 3.6 / (Po_comp / 1000.0), 0)
+    out["P_Dehumidity_PoWD"] = np.where(Po_wd > 0, water_gs * 3.6 / (Po_wd / 1000.0), 0)
 
     # 압축기 효율: η_comp = (h_out_is - h_in) / (h_out - h_in)
     h_in_c = ref_comp["h_in"]
