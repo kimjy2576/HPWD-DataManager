@@ -1,7 +1,8 @@
 """
 server.py — FastAPI 백엔드 (v5 — Merge / Calculation 분리)
 """
-import os, sys, uuid, time, traceback
+import os, sys, uuid, time, traceback, re, csv
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -226,14 +227,365 @@ def _num_or(v, default):
     return x if np.isfinite(x) else default
 
 
+# ══════════════════════════════════════════════
+#  텍스트 계측 파일 (.dat / .txt 등) 읽기
+# ══════════════════════════════════════════════
+# .csv/.tsv 는 확장자로 구분자를 정하는 기존 경로를 그대로 쓰고, 그 밖의 확장자는
+# 내용을 보고 구분자·헤더 줄·단위 줄·인코딩을 판별한다. (.dat 은 장비마다 형식이 다름 —
+# 탭/공백/세미콜론 구분, 앞쪽 설명 블록, 헤더 아래 단위 줄, UTF-16 저장 등)
+# 식별 규칙에 없어도 내용으로 소스를 판별하는 확장자. (.txt 는 메모·다른 표일 때가 많아 자동 판별에서 뺌 —
+#  식별 규칙의 확장자에 넣으면 .dat 와 같은 방식으로 읽음)
+_GENERIC_TEXT_EXTS = (".dat",)
+_CTRL_BYTES = bytes(list(range(0, 9)) + list(range(14, 32)))
+_SEP_NAMES = {"\t": "탭", ",": "쉼표", ";": "세미콜론", "|": "세로줄", " ": "공백"}
+_RX_DATE_CELL = re.compile(r"^\d{2,4}[-/.]\d{1,2}[-/.]\d{1,4}")
+_RX_CLOCK_CELL = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?([.,]\d+)?$")
+_RX_DEC_COMMA = re.compile(r"^[-+]?\d+,\d+$")
+_RX_DEC_POINT = re.compile(r"^[-+]?\d*\.\d+$")
+_RX_UNIT_CELL = re.compile(
+    r"^[\[(]?\s*(s|sec|ms|min|h|hr|hour|°c|℃|degc|deg c|deg|c|k|v|mv|volts?|a|ma|amps?|w|kw|kwh|wh|"
+    r"va|var|pf|%|%rh|rh|pa|kpa|mpa|bar|bara|barg|psi|hz|rpm|g|kg|l|lpm|l/min|m3/h|cmm|cmh|m/s|"
+    r"ts|rn|smp|avg|max|min|tot|std)\s*[\])]?$", re.I)
+# 단위 줄에 자주 나오는 형식 표기·자리표시: 'hh:mm:ss', 'yyyy/mm/dd', '-', 'n/a'
+_RX_FMT_CELL = re.compile(r"^(-+|n/?a|[hmsdy]{1,4}([:/.\- ][hmsdy]{1,4})+(\.[0s]+)?)$", re.I)
+
+
+def _file_kind(path, nbytes=65536):
+    """파일 앞부분 바이트로 종류 판별 → (종류, 인코딩 힌트).
+
+    종류: 'text' | 'excel' | 'binary' | 'missing'. 확장자는 보지 않는다
+    (.dat 은 텍스트 표일 수도, 장비 고유 형식의 바이너리일 수도 있음)."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(nbytes)
+    except OSError:
+        return "missing", None
+    if head.startswith((b"PK\x03\x04", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")):
+        return "excel", None
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "text", "utf-16"
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "text", "utf-8-sig"
+    if b"\x00" in head:
+        ev, od = head[0::2], head[1::2]      # BOM 없는 UTF-16: 한 바이트 건너 NUL
+        if od.count(0) > 0.3 * len(od) and ev.count(0) < 0.1 * max(len(ev), 1):
+            return "text", "utf-16-le"
+        if ev.count(0) > 0.3 * len(ev) and od.count(0) < 0.1 * max(len(od), 1):
+            return "text", "utf-16-be"
+        return "binary", None
+    if len(head) - len(head.translate(None, _CTRL_BYTES)) > 0.01 * max(len(head), 1):
+        return "binary", None
+    return "text", None
+
+
+def _read_head_lines(path, enc_hint=None, max_lines=300):
+    """앞쪽 줄들과 인코딩. 힌트(BOM/UTF-16)가 없으면 UTF-8 → cp949 → latin1 순으로 시도."""
+    encs = [enc_hint] if enc_hint else ["utf-8-sig", "utf-8", "cp949", "euc-kr", "latin1"]
+    for enc in encs:
+        try:
+            lines = []
+            with open(path, "r", encoding=enc, newline="") as f:
+                for _ in range(max_lines):
+                    ln = f.readline()
+                    if not ln:
+                        break
+                    lines.append(ln.rstrip("\r\n"))
+            return lines, enc
+        except UnicodeError:
+            continue
+        except OSError:
+            break
+    return [], None
+
+
+def _split_cells(line, sep):
+    if sep == " ":
+        return line.split()
+    if '"' not in line:
+        return line.split(sep)
+    try:
+        return next(csv.reader([line], delimiter=sep))
+    except Exception:
+        return line.split(sep)
+
+
+def _cell_kind(c, dec="."):
+    """'' (빈칸) | 'num' | 'time' (날짜·시각) | 'text'"""
+    c = c.strip().strip('"').strip()
+    if not c:
+        return ""
+    try:
+        float(c.replace(",", ".") if dec == "," else c)
+        return "num"
+    except ValueError:
+        pass
+    if _RX_DATE_CELL.match(c) or _RX_CLOCK_CELL.match(c) or c[:2] in ("오전", "오후"):
+        return "time"
+    return "text"
+
+
+def _sniff_table(path, enc_hint=None, max_lines=300):
+    """텍스트 표 구조 판별 (앞 300줄 기준). 표가 아니면 None.
+
+    1) 구분자: 데이터 쪽(뒤 절반) 줄들의 칸 수가 일정한 것 — 탭 > 세미콜론 > 쉼표 > 세로줄 > 공백
+    2) 데이터 시작: 끝에서부터 '칸 수가 같고 대부분 숫자·시각인 줄'이 이어지는 구간의 처음
+    3) 헤더: 데이터 바로 위 줄들(최대 5줄) 중 이름다운 줄 — 나머지(단위·집계 표시 줄)는 건너뜀
+    줄 번호는 모두 파일의 물리적 줄(0부터)."""
+    lines, enc = _read_head_lines(path, enc_hint, max_lines)
+    nz = [(i, ln) for i, ln in enumerate(lines) if ln.strip()]
+    if len(nz) < 2:
+        return None
+    tail = nz[len(nz) // 2:] if len(nz) >= 10 else nz
+
+    best = None
+    for sep in ("\t", ";", ",", "|", " "):
+        cnt = Counter(len(_split_cells(ln, sep)) for _, ln in tail)
+        multi = [(k, v) for k, v in cnt.items() if k >= 2]
+        if not multi:
+            continue
+        m_, f_ = max(multi, key=lambda kv: (kv[1], kv[0]))
+        cand = (f_ / len(tail), m_, sep)
+        if cand[0] >= 0.8:
+            best = cand
+            break
+        if best is None or cand[:2] > best[:2]:
+            best = cand
+    if best is None or best[0] < 0.5:
+        return None
+    _, m, sep = best
+
+    dec = "."
+    if sep != ",":
+        cells = [c.strip() for _, ln in tail for c in _split_cells(ln, sep)]
+        n_comma = sum(1 for c in cells if _RX_DEC_COMMA.match(c))
+        n_point = sum(1 for c in cells if _RX_DEC_POINT.match(c))
+        if n_comma >= 5 and n_comma > 2 * n_point:
+            dec = ","
+
+    rows = []
+    for i, ln in nz:
+        cells = _split_cells(ln, sep)
+        kinds = [_cell_kind(c, dec) for c in cells]
+        ne = [k for k in kinds if k]
+        rows.append({"i": i, "n": len(cells), "cells": cells, "kinds": kinds,
+                     "ratio": (sum(1 for k in ne if k != "text") / len(ne)) if ne else 0.0})
+    tol = max(1, m // 10)
+    fits = lambda r: r["n"] >= 2 and abs(r["n"] - m) <= tol
+    is_data = lambda r: fits(r) and r["ratio"] >= 0.6
+
+    def header_like(r):
+        txt = [c.strip().strip('"') for c, k in zip(r["cells"], r["kinds"]) if k == "text"]
+        return fits(r) and r["ratio"] < 0.5 and len(txt) >= 2
+
+    # 데이터 구간: 끝에서부터 위로 (마지막 2줄은 잘린 줄일 수 있어 건너뛸 수 있음)
+    k = len(rows) - 1
+    while k > 0 and not is_data(rows[k]) and k >= len(rows) - 3:
+        k -= 1
+    if not is_data(rows[k]):
+        return None
+    start, j = k, k - 1
+    while j >= 0:
+        if is_data(rows[j]):
+            start = j
+        elif not (j >= 1 and is_data(rows[j - 1]) and rows[j - 1]["n"] == rows[start]["n"]
+                  and not header_like(rows[j])):
+            break      # 데이터 사이에 낀 한 줄(이벤트 표시·잘린 줄)은 건너뛰고, 그 밖에는 멈춤
+        j -= 1
+
+    # 헤더: 데이터 바로 위 최대 5줄 (칸 수가 맞는 줄이 이어지는 동안)
+    cand = []
+    c = start - 1
+    while c >= 0 and len(cand) < 5 and fits(rows[c]) and not is_data(rows[c]):
+        cand.append(c)
+        c -= 1
+
+    def uniq_text(r):
+        return {x.strip().strip('"') for x, kd in zip(r["cells"], r["kinds"]) if kd == "text"}
+
+    def name_score(r):
+        # 이름 줄 > 단위 줄('s','°C','[V]','hh:mm:ss','-' …)·집계 줄('Avg','Smp').
+        # 시간 열 이름('Time','TIMESTAMP','시간')이 있으면 이름 줄일 가능성이 큼
+        u = uniq_text(r)
+        unit = sum(1 for x in u if _RX_UNIT_CELL.match(x) or _RX_FMT_CELL.match(x))
+        has_t = any(re.match(r"(date[ _/-]?)?time(stamp)?\b|date\b|시간|시각|일시|날짜", x.lower()) for x in u)
+        return len(u) - 2 * unit + 3 * has_t
+    h = None
+    if len(cand) == 1:      # 후보가 한 줄이면 이름이 'V','A','W' 같아도 헤더로 인정
+        h = cand[0] if len(uniq_text(rows[cand[0]])) >= 2 else None
+    elif cand:
+        # cand 는 데이터에 가까운 순 → 뒤집어서 동점이면 위쪽 줄(이름 줄이 단위 줄보다 위에 옴)
+        h = max(reversed(cand), key=lambda c: name_score(rows[c]))
+        if name_score(rows[h]) <= 0 and len(uniq_text(rows[h])) < 2:
+            h = None
+    # 파일 앞쪽에 같은 헤더가 또 있으면(로거 재시작으로 헤더 반복) 첫 헤더부터 읽음
+    if h is not None:
+        for x in range(h):
+            if rows[x]["cells"] == rows[h]["cells"]:
+                start = x + (start - h)
+                h = x
+                break
+
+    data_rows = [r for r in rows[start:] if is_data(r)]
+    width = max([r["n"] for r in data_rows] + [m])
+    if h is not None:
+        hdr = rows[h]
+        names = [x.strip().strip('"').strip() for x in hdr["cells"]]
+        if sep == " " and len(names) != m:                  # 공백 정렬 표: 이름 안의 공백 처리
+            alt = [x.strip('"') for x in re.split(r"\t+|\s{2,}", lines[hdr["i"]].strip())]
+            if len(alt) == m:
+                names = alt
+    else:
+        names = []
+    # 공백 구분에서 'YYYY/MM/DD hh:mm:ss' 가 두 칸으로 갈라진 경우 → 읽은 뒤 합침
+    dt_merge = False
+    if sep == " " and h is not None and len(names) == m - 1:
+        smp = data_rows[:20]
+        dt_merge = bool(smp) and all(
+            _RX_DATE_CELL.match(r["cells"][0]) and _RX_CLOCK_CELL.match(r["cells"][1]) for r in smp)
+    blank = []
+    for jx, nm in enumerate(names):
+        if not nm:
+            names[jx] = f"Col{jx + 1}"
+            blank.append(names[jx])
+    if not names:
+        names = [f"Col{jx + 1}" for jx in range(m)]
+    return {
+        "enc": enc, "sep": sep, "dec": dec, "ncols": m, "width": width,
+        "header": rows[h]["i"] if h is not None else None,
+        "data_line": rows[start]["i"],
+        "units": (start - h - 1) if h is not None else 0,
+        "preamble": h if h is not None else start,
+        "names": names, "blank_names": blank, "dt_merge": dt_merge,
+        "rows": len(data_rows), "first": nz[0][1][:80],
+    }
+
+
+def _read_generic_table(path, file_rules=None, src_key="nidaq", default_skip=0, nrows=None):
+    """.csv/.tsv 가 아닌 텍스트 표(.dat/.txt 등) 읽기 — 구조는 _sniff_table 이 판별."""
+    name = os.path.basename(str(path))
+
+    def note(msg):
+        msg = f"  [read_dat] {name}: {msg}"
+        print(msg)
+        _READ_NOTES.append(msg)
+
+    kind, enc_hint = _file_kind(path)
+    if kind == "binary":
+        note("⚠️ 텍스트가 아닌 바이너리 파일이라 읽을 수 없음 — 측정 프로그램에서 CSV/텍스트로 "
+             "내보내기 필요 (diagnose.bat 리포트로 형식 확인 가능)")
+        return pd.DataFrame()
+    if kind == "excel":
+        note(f"⚠️ 엑셀 형식 파일 — {src_key.upper()} 는 텍스트 표만 읽음 (엑셀은 MX100 확장자 규칙으로)")
+        return pd.DataFrame()
+    if kind == "missing":
+        note("⚠️ 파일을 열 수 없음")
+        return pd.DataFrame()
+    try:
+        st = _sniff_table(path, enc_hint)
+    except Exception as e:
+        note(f"⚠️ 형식 판별 실패: {type(e).__name__}: {str(e)[:150]}")
+        return pd.DataFrame()
+    if st is None:
+        note("⚠️ 표 형태(구분자로 나뉜 열 + 숫자 데이터 줄)를 찾지 못해 읽지 않음")
+        return pd.DataFrame()
+
+    names = list(st["names"])
+    if st["dt_merge"]:
+        names = ["__date__", "__clock__"] + names[1:]
+    if len(names) < st["width"]:
+        names += [f"_extra_{k + 1}" for k in range(st["width"] - len(names))]
+    names = _dedupe_names(names)
+    kw = dict(sep=r"\s+" if st["sep"] == " " else st["sep"], header=None, names=names,
+              skiprows=st["data_line"], index_col=False, encoding=st["enc"],
+              encoding_errors="replace", decimal=st["dec"])
+    if nrows:
+        kw["nrows"] = nrows
+    bad = []
+    try:
+        df = pd.read_csv(path, low_memory=False, **kw)
+    except Exception:
+        def _cut(row):
+            bad.append(len(row))
+            return row[:len(names)]
+        try:
+            df = pd.read_csv(path, engine="python", on_bad_lines=_cut, **kw)
+        except Exception as e:      # 이상한 파일 하나 때문에 케이스 병합 전체가 멈추지 않게
+            note(f"⚠️ 읽기 실패: {type(e).__name__}: {str(e)[:150]}")
+            return pd.DataFrame()
+
+    if st["dt_merge"] and "__date__" in df.columns:
+        df.insert(0, st["names"][0],
+                  df.pop("__date__").astype(str) + " " + df.pop("__clock__").astype(str))
+    df.columns = [str(c).strip() for c in df.columns]
+    # 파일 중간에 반복된 헤더 줄(로거 재시작) 제거 → 그 열들이 문자형으로 남지 않게
+    n_rep = 0
+    if st["header"] is not None and len(df):
+        hdr_vals = [str(x) for x in st["names"]][:len(df.columns)]
+        k = min(3, len(hdr_vals))
+        if k >= 2:
+            rep = np.ones(len(df), dtype=bool)
+            for jx in range(k):
+                rep &= (df.iloc[:, jx].astype(str).str.strip() == hdr_vals[jx]).to_numpy()
+            n_rep = int(rep.sum())
+            if n_rep:
+                df = df.loc[~rep].reset_index(drop=True)
+                for c in df.columns[1:]:
+                    if df[c].dtype == object or str(df[c].dtype).startswith("str"):
+                        conv = pd.to_numeric(df[c], errors="coerce")
+                        if conv.notna().sum() == df[c].notna().sum():
+                            df[c] = conv
+    # 값이 전부 빈 '이름 없는 칸'·'데이터보다 넓은 헤더 칸'(행 끝 구분자, LabVIEW Comment 등) 제거
+    extra_hdr = set(names[st["width"]:])
+    drop = [c for c in df.columns
+            if (c.startswith("_extra_") or c in st["blank_names"] or c in extra_hdr) and df[c].isna().all()]
+    df = df.drop(columns=drop)
+
+    enc_name = {"utf-8-sig": "UTF-8", "utf-8": "UTF-8", "cp949": "CP949(한글)", "euc-kr": "EUC-KR(한글)",
+                "utf-16": "UTF-16", "utf-16-le": "UTF-16", "utf-16-be": "UTF-16"}.get(st["enc"], st["enc"])
+    parts = [f"구분자 {_SEP_NAMES.get(st['sep'], repr(st['sep']))}", f"인코딩 {enc_name}"]
+    if st["dec"] == ",":
+        parts.append("소수점 쉼표")
+    parts.append(f"헤더 {st['header'] + 1}번째 줄" if st["header"] is not None
+                 else "헤더 줄 없음(열 이름 Col1, Col2 …)")
+    if st["preamble"]:
+        parts.append(f"앞쪽 설명 {st['preamble']}줄 건너뜀")
+    if st["units"]:
+        parts.append(f"헤더 아래 단위·보조 줄 {st['units']}개 건너뜀")
+    if st["dt_merge"]:
+        parts.append("날짜·시각 두 칸을 한 칸으로 합침")
+    if n_rep:
+        parts.append(f"중간에 반복된 헤더 줄 {n_rep}개 제외")
+    note(f"텍스트 표로 읽음 — {', '.join(parts)} → {len(df):,}행 × {len(df.columns)}열")
+    if bad:
+        note(f"⚠️ 칸 수가 다른 줄 {len(bad)}개 → 초과분 잘라서 읽음")
+    return df
+
+
 def read_source_csv(path, file_rules, src_key, default_skip=1, nrows=None):
     """csv/tsv 읽기 — 인코딩 폴백 + 헤더 행 자동 탐지 + 레이아웃 보정.
 
     앱(Merge)·변수 스캔·진단 도구(tools/diagnose.py)가 같은 경로를 쓰도록 모듈 수준에 둠.
     (스캔이 따로 읽으면 BOM·헤더 행·쉼표 헤더 처리 차이로 변수명이 Merge 와 달라짐)
     nrows: 앞쪽 일부 행만 읽기 (변수 스캔용)
+    .csv/.tsv 가 아닌 확장자(.dat 등)는 내용으로 구조를 판별하는 _read_generic_table 로.
     """
-    sep = '\t' if path.lower().endswith('.tsv') else ','
+    path = str(path)
+    if os.path.splitext(path)[1].lower() not in (".csv", ".tsv"):
+        # AMS/BR 로그가 .dat 로 저장된 경우: 쉼표·탭 구분이면 기존 csv 경로로 읽어
+        # .csv 와 똑같은 열 이름(쉼표 포함 헤더 보정 등)을 만든다 → 이름 매핑·변수 표가 그대로 맞음
+        st = None
+        if src_key in ("ams", "br"):
+            kind, enc_hint = _file_kind(path)
+            if kind == "text" and not (enc_hint or "").startswith("utf-16"):
+                try:
+                    st = _sniff_table(path, enc_hint)
+                except Exception:
+                    st = None
+        if not st or st["sep"] not in (",", "\t"):
+            return _read_generic_table(path, file_rules, src_key, default_skip, nrows)
+        sep = st["sep"]
+    else:
+        sep = '\t' if path.lower().endswith('.tsv') else ','
     skip = (file_rules or {}).get(src_key, {}).get("skip_rows", default_skip)
 
     # 인코딩 결정
@@ -772,18 +1124,22 @@ def select_cases(req: SelectRequest):
     category = Path(req.category_path)
     if not category.exists(): raise HTTPException(404, f"경로 없음: {req.category_path}")
     sid = str(uuid.uuid4())[:8]
-    case_files = {}
+    case_files, unmatched = {}, {}
     for case in req.case_names:
         case_dir = category / case
         if not case_dir.is_dir(): continue
-        case_files[case] = _classify_files(case_dir, DEFAULT_CFG.get("file_rules"), DEFAULT_CFG.get("processing",{}).get("data_sources"))
+        um = []
+        case_files[case] = _classify_files(case_dir, DEFAULT_CFG.get("file_rules"),
+                                           DEFAULT_CFG.get("processing",{}).get("data_sources"), unmatched=um)
+        if um:
+            unmatched[case] = um
     if not case_files: raise HTTPException(400, "유효한 케이스 없음")
     sessions[sid] = {
         "status": "ready", "progress": 0, "log": [], "error": None,
         "category_path": str(category), "case_files": case_files,
         "merge_results": [], "calc_results": [],
     }
-    return {"session_id": sid, "cases": case_files}
+    return {"session_id": sid, "cases": case_files, "unmatched": unmatched}
 
 
 def _peek_header(path: Path, skip_rows: int = 1) -> str:
@@ -828,8 +1184,36 @@ def _sniff_source(path: Path, file_rules: dict, candidates=("ams", "br")) -> str
     return None
 
 
-def _classify_files(folder: Path, file_rules: dict = None, active_sources: list = None) -> dict:
-    """파일 식별 규칙에 따라 소스별 분류. active_sources로 필터."""
+def _auto_text_source(path: Path, file_rules: dict):
+    """식별 규칙에 안 맞은 .dat 를 내용으로 판별 → (소스 | None, 이유).
+
+    AMS 헤더 특징이 있으면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 본다.
+    BR 은 열 이름 특징('t_air_', 'p_comp' 등)이 일반 계측 채널 이름과 겹쳐 자동으로 고르지 않음."""
+    kind, enc = _file_kind(path)
+    if kind == "binary":
+        return None, "텍스트가 아닌 바이너리 파일 — 측정 프로그램에서 CSV/텍스트로 내보내야 읽을 수 있음"
+    if kind == "excel":
+        return None, "엑셀 형식 — MX100 확장자 규칙에 넣으면 MX100 으로 읽음"
+    if kind != "text":
+        return None, "파일을 열 수 없음"
+    lines, _ = _read_head_lines(path, enc, 40)
+    head = "\n".join(lines).lower()
+    if "ams" in file_rules and sum(1 for s in _SIG["ams"] if s in head) >= 2:
+        return "ams", "AMS 헤더"
+    st = _sniff_table(path, enc)
+    if not st or st["rows"] < 2:
+        return None, "표 형태 데이터가 아님"
+    if "nidaq" in file_rules:
+        return "nidaq", f"일반 계측 데이터 {st['ncols']}열"
+    return None, "NIDAQ(일반 계측) 소스가 꺼져 있음 — Setting 의 사용 소스에서 NIDAQ 를 켜면 병합됨"
+
+
+def _classify_files(folder: Path, file_rules: dict = None, active_sources: list = None,
+                    unmatched: list | None = None) -> dict:
+    """파일 식별 규칙에 따라 소스별 분류. active_sources로 필터.
+
+    규칙에 안 맞은 .dat 는 내용으로 판별(_auto_text_source).
+    unmatched 에 리스트를 주면 어느 소스에도 안 들어간 데이터 파일을 {file, why} 로 담는다."""
     if not file_rules:
         file_rules = {
             "mx100": {"extensions": [".xls", ".xlsx"], "include_patterns": []},
@@ -873,8 +1257,24 @@ def _classify_files(folder: Path, file_rules: dict = None, active_sources: list 
             files[src].append(f.name)
             matched = True
             break
-        if not matched and n.endswith(('.csv','.tsv','.xls','.xlsx')):
+        if matched:
+            continue
+        if n.endswith(_GENERIC_TEXT_EXTS):
+            try:
+                src, why = _auto_text_source(f, file_rules)
+            except Exception as e:   # 판별 오류로 케이스 선택 자체가 막히지 않게
+                src, why = None, f"형식 판별 중 오류 ({type(e).__name__})"
+            if src:
+                files[src].append(f.name)
+                print(f"  [classify] 내용 판별: {f.name} → {src.upper()} ({why})")
+                continue
+            print(f"  [classify] 미분류: {f.name} — {why}")
+            if unmatched is not None:
+                unmatched.append({"file": f.name, "why": why})
+        elif n.endswith(('.csv','.tsv','.xls','.xlsx')):
             print(f"  [classify] 미분류: {f.name} (ext={f.suffix})")
+            if unmatched is not None:
+                unmatched.append({"file": f.name, "why": "식별 규칙(확장자·포함/제외 패턴)에 맞는 사용 소스 없음"})
     print(f"  [classify] 결과: {{{', '.join(f'{k}={len(v)}' for k,v in files.items())}}}")
     return files
 
@@ -1123,9 +1523,10 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 np_list = [str(case_dir / f) for f in cf.get("nidaq",[])] if use_ni and cf.get("nidaq") else None
 
                 t1 = time.perf_counter()
-                df_ams, df_br, df_mx, df_ni = _read(ap, bp, mp_list, dt, np_list=np_list, file_rules=cfg.get("file_rules"))
+                df_ams, df_br, df_mx, ni_parts = _read(ap, bp, mp_list, dt, np_list=np_list, file_rules=cfg.get("file_rules"))
+                df_ni = ni_parts[0] if ni_parts else pd.DataFrame()   # NIDAQ 첫 묶음 (기준 시간축용)
                 _READ_NOTES.clear()   # 내용은 print() 로 이미 로그에 전달됨
-                _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (AMS={len(df_ams)}행 BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={len(df_ni)}행/{len(cf.get('nidaq',[]))}파일)")
+                _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (AMS={len(df_ams)}행 BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={sum(len(p) for p in ni_parts)}행/{len(cf.get('nidaq',[]))}파일)")
 
                 t1 = time.perf_counter()
                 # 선택된 소스만 전처리
@@ -1153,26 +1554,19 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 else:
                     df_mx_proc = pd.DataFrame()
 
-                # NI DAQ 전처리 (Time 컬럼 + 숫자 변환)
-                if use_ni and not df_ni.empty:
-                    df_ni_proc = df_ni.copy()
-                    # Time 컬럼 확인/변환
-                    if "Time" not in df_ni_proc.columns:
-                        for alt in ["time","DateTime","Timestamp","Date_Time"]:
-                            if alt in df_ni_proc.columns:
-                                df_ni_proc.rename(columns={alt:"Time"}, inplace=True); break
-                        else:
-                            df_ni_proc.rename(columns={df_ni_proc.columns[0]:"Time"}, inplace=True)
-                    num_cols = df_ni_proc.columns.difference(["Time"])
-                    for col in num_cols:
-                        df_ni_proc[col] = pd.to_numeric(df_ni_proc[col], errors="coerce")
-                else:
-                    df_ni_proc = pd.DataFrame()
+                # NI DAQ(일반 계측 — .tsv/.dat 등) 전처리 (Time 컬럼 + 숫자 변환) — 파일 묶음별
+                ni_procs = []
+                for part in (ni_parts if use_ni else []):
+                    p_ = _prep_generic_time(part.copy(), "NIDAQ")
+                    for col in p_.columns.difference(["Time"]):
+                        p_[col] = pd.to_numeric(p_[col], errors="coerce")
+                    ni_procs.append(p_)
+                df_ni_proc = ni_procs[0] if ni_procs else pd.DataFrame()
                 _log(sid, f"  ⚙️ 전처리: {time.perf_counter()-t1:.1f}s")
 
                 t1 = time.perf_counter()
                 merged = sync_and_merge(
-                    [df_br_main, df_br_add, df_mx_proc, df_ams_proc, df_ni_proc],
+                    [df_br_main, df_br_add, df_mx_proc, df_ams_proc] + (ni_procs or [df_ni_proc]),
                     ref_eff, df_br_main, df_ams_proc, df_mx_proc, df_nidaq=df_ni_proc)
                 _log(sid, f"  🔗 시간동기화: {time.perf_counter()-t1:.1f}s ({len(merged)}행)")
 
@@ -1771,6 +2165,105 @@ def auto_map(req: BrowseRequest):
 # ══════════════════════════════════════════════
 #  공통 유틸
 # ══════════════════════════════════════════════
+_TIME_COL_NAMES = ("time", "datetime", "date_time", "date/time", "date time", "timestamp", "time stamp",
+                   "logtime", "log time", "시간", "시각", "일시", "측정시간", "측정 시간", "측정시각")
+
+
+def _pick_time_col(cols):
+    """시간 열 이름 찾기 (대소문자·공백 무시, 'Time (s)'·'TIMESTAMP' 등 변형 포함). 없으면 None."""
+    low = {}
+    for c in cols:
+        low.setdefault(str(c).strip().lower(), c)
+    for nm in _TIME_COL_NAMES:
+        if nm in low:
+            return low[nm]
+    for c in cols:
+        if re.match(r"(date[ _/-]?)?time(stamp)?\b|시간|시각", str(c).strip().lower()):
+            return c
+    return None
+
+
+def _prep_generic_time(df, label="NIDAQ"):
+    """일반 계측 데이터(NIDAQ·.dat 등)의 Time 열 정리 — 다른 소스와 시계 시각으로 맞추기 위함.
+
+    - 시간 열 이름 찾기 (대소문자·변형), 없으면 첫 열
+    - '오전/오후 h:mm:ss' → 24시간제
+    - 숫자 시간: 엑셀 날짜 일련값 / LabVIEW 시각(1904년 기준 초) / Unix 시각(초·ms) → 현지 시각,
+      그 밖의 숫자는 경과 시간(열 이름에 ms·min·h 가 있으면 그 단위, 없으면 초)."""
+    if df.empty:
+        return df
+    if "Time" not in df.columns:
+        tc = _pick_time_col(df.columns)
+        if tc is None:
+            tc = df.columns[0]
+            print(f"  [{label}] 시간 열 이름을 찾지 못해 첫 열 '{tc}' 을 시간으로 사용")
+        elif str(tc) != "Time":
+            print(f"  [{label}] 시간 열: '{tc}'")
+        df = df.rename(columns={tc: "Time"})
+    else:
+        tc = "Time"
+    t = df["Time"]
+    if pd.api.types.is_datetime64_any_dtype(t):
+        return df
+    # 날짜와 시각이 다른 열(Date | Time)이면 합쳐서 사용 (자정 넘김·여러 날 측정 대비)
+    first = t.dropna().astype(str).str.strip()
+    first = first.iloc[0] if len(first) else ""
+    if _RX_CLOCK_CELL.match(first):
+        dcol = next((c for c in df.columns if str(c).strip().lower() in ("date", "날짜", "일자", "측정일")), None)
+        if dcol is not None and df[dcol].notna().any():
+            dfirst = str(df[dcol].dropna().iloc[0]).strip()
+            if _RX_DATE_CELL.match(dfirst) and ":" not in dfirst:
+                df["Time"] = df[dcol].astype(str).str.strip() + " " + t.astype(str).str.strip()
+                df = df.drop(columns=[dcol])
+                print(f"  [{label}] '{dcol}' 열과 시각 열을 합쳐 시간으로 사용")
+                return df
+    num = pd.to_numeric(t, errors="coerce")
+    if len(num) and num.notna().mean() >= 0.9:
+        import datetime as _dt
+        med = float(num.median())
+        step = float(num.diff().abs().median()) if len(num) > 1 else 1.0
+        off = pd.Timedelta(_dt.datetime.now().astimezone().utcoffset() or _dt.timedelta(0))
+        if 20000 < med < 80000 and step < 0.01:      # 하루 = 1 → 1초 간격이면 1.16e-5
+            df["Time"] = pd.Timestamp("1899-12-30") + pd.to_timedelta(num, unit="D")
+            kind = "엑셀 날짜 일련값"
+        elif 2.5e9 < med < 5e9:
+            df["Time"] = pd.Timestamp("1904-01-01") + pd.to_timedelta(num, unit="s") + off
+            kind = "LabVIEW 시각(1904년 기준 초, UTC → 이 PC 시간대)"
+        elif 1e9 < med < 2.5e9:
+            df["Time"] = pd.Timestamp("1970-01-01") + pd.to_timedelta(num, unit="s") + off
+            kind = "Unix 시각(초, UTC → 이 PC 시간대)"
+        elif 1e12 < med < 2.5e12:
+            df["Time"] = pd.Timestamp("1970-01-01") + pd.to_timedelta(num, unit="ms") + off
+            kind = "Unix 시각(ms, UTC → 이 PC 시간대)"
+        else:
+            nm = str(tc).lower()
+            unit, uname = "s", "초"
+            if re.search(r"\bms\b|msec|milli", nm):
+                unit, uname = "ms", "ms"
+            elif re.search(r"\bmin\b|minute|\[min\]|\(min\)|분", nm):
+                unit, uname = "min", "분"
+            elif re.search(r"\bh\b|\bhr\b|hour|\[h\]|\(h\)", nm):
+                unit, uname = "h", "시간"
+            df["Time"] = pd.Timestamp("2000-01-01") + pd.to_timedelta(num, unit=unit)
+            kind = (f"경과 시간({uname}) — 00:00:00 부터로 봄. 다른 소스가 시계 시각이면 서로 시간이 "
+                    f"맞지 않으니 기준 시간축을 {label} 로 두거나 단독으로 병합")
+        df["Time"] = df["Time"].dt.round("ms")   # 일련값·실수 오차(µs) 때문에 1초 격자와 어긋나지 않게
+        print(f"  [{label}] Time 이 숫자 → {kind}")
+        return df
+    s = t.astype(str)
+    if s.str.contains("오전|오후", regex=True).any():
+        s2 = s.str.replace(r"(오전|오후)\s*(\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)",
+                           lambda m: f"{m.group(2)} {'AM' if m.group(1) == '오전' else 'PM'}", regex=True)
+        try:
+            conv = pd.to_datetime(s2, errors="coerce", format="mixed")
+        except (TypeError, ValueError):
+            conv = pd.to_datetime(s2, errors="coerce")
+        if conv.notna().mean() >= 0.8:
+            df["Time"] = conv
+            print(f"  [{label}] Time '오전/오후' 표기 → 24시간제로 변환")
+    return df
+
+
 def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
     """
     소스별 파일 읽기. mp_list/np_list는 리스트(여러 파일 → 컬럼 병합).
@@ -1783,6 +2276,10 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
 
     def _read_excel(path):
         skip = fr.get("mx100",{}).get("skip_rows",24)
+        if _file_kind(path)[0] in ("text", "binary"):
+            print(f"  [MX100] {os.path.basename(path)}: ⚠️ 엑셀 파일이 아님 — MX100 은 엑셀(.xls/.xlsx)만 읽음. "
+                  f"텍스트 계측 파일이면 Setting > 파일 식별 규칙에서 이 확장자를 MX100 대신 NIDAQ 에 넣으세요")
+            return pd.DataFrame()
         try:
             df = pd.read_excel(path, skiprows=skip, header=0)
             df.columns = [c.strip() for c in df.columns]
@@ -1835,18 +2332,26 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
                     print(f"  [MX100] {os.path.basename(mp)}: {len(df)}행 × {len(df.columns)}열")
         df_m = _merge_multi(mx_dfs)
 
-    # NIDAQ: 여러 파일 → 컬럼 병합
+    # NIDAQ(일반 계측 — .tsv/.dat 등): 여러 파일
+    #   열 구성이 같은 파일(시간대별로 나뉜 로그) → 행으로 이어 붙임
+    #   열 구성이 다른 파일(다른 장비) → 각각 따로 두고 시간 동기화에서 1초 격자에 맞춤
+    #   (예전에는 Time 값이 정확히 같은 행끼리만 열 병합 → 장비마다 시각·형식이 다르면 어긋나고,
+    #    열이 같은 두 번째 파일은 통째로 빠졌음)
+    ni_parts = []
     if np_list:
-        ni_dfs = []
+        groups = {}
         for np_ in (np_list if isinstance(np_list, list) else [np_list]):
             if np_ and os.path.exists(np_):
                 df = _read_csv(np_, "nidaq", 0)
                 if not df.empty:
-                    ni_dfs.append(df)
+                    groups.setdefault(tuple(df.columns), []).append(df)
                     print(f"  [NIDAQ] {os.path.basename(np_)}: {len(df)}행 × {len(df.columns)}열")
-        df_n = _merge_multi(ni_dfs)
+        for g in groups.values():
+            if len(g) > 1:
+                print(f"  [NIDAQ] 열 구성이 같은 파일 {len(g)}개 → 이어 붙임")
+            ni_parts.append(pd.concat(g, ignore_index=True) if len(g) > 1 else g[0])
 
-    return df_a, df_b, df_m, df_n
+    return df_a, df_b, df_m, ni_parts
 
 def _log(sid, msg):
     if sid in sessions: sessions[sid]["log"].append(msg)

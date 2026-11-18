@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-HPWD Data Manager — AMS 데이터 진단 도구
+HPWD Data Manager — 데이터 진단 도구 (AMS .csv / 계측 .dat·.txt·.tsv)
 
 실제 파일을 앱(Merge)과 '같은 코드 경로'로 읽어서, 원본 값 없이 요약 리포트만 만든다.
 리포트 텍스트만 공유하면 되므로 데이터가 PC 밖으로 나가지 않는다.
-(포함되는 값: 개수, 칸 수, 시간 길이, 주요 변수의 최소/중앙/최대 같은 집계값뿐)
+(포함되는 값: 개수, 칸 수, 시간 길이, 주요 변수의 최소/중앙/최대 같은 집계값뿐.
+ .dat 등 계측 파일은 형식 확인용으로 첫 줄·열 이름도 표시 — --mask 로 숨김)
 
 사용:
-  python tools/diagnose.py <AMS.csv | 케이스폴더 | 상위폴더> [...]
+  python tools/diagnose.py <AMS.csv | 계측.dat | 케이스폴더 | 상위폴더> [...]
   python tools/diagnose.py <경로> --mask      파일/폴더 이름 가리기
   또는 diagnose.bat 위에 파일/폴더를 끌어다 놓기
 
@@ -456,6 +457,121 @@ def diagnose_ams(R: Report, path: Path, label: str, srv, pre, cfg, fr) -> dict:
     return info
 
 
+def diagnose_table(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool) -> dict:
+    """AMS 가 아닌 계측 파일(.dat/.txt/.tsv 등) — 형식(구조)과 시간 축만 요약. 데이터 값은 넣지 않음."""
+    import pandas as pd
+
+    R.ctx = label
+    R.h(f"계측 파일: {label}")
+
+    def hide(s: str) -> str:      # --mask: 파일 이름·열 이름('…') 가림
+        if not mask:
+            return s
+        return re.sub(r"'[^']*'", "'…'", s.replace(path.name, label))
+    R.add(f"  크기 {path.stat().st_size / 1e6:.2f} MB")
+    kind, enc_hint = srv._file_kind(str(path))
+    if kind == "binary":
+        R.flag("err", "텍스트가 아닌 바이너리 파일 — 앱에서 읽을 수 없음. 측정 프로그램에서 CSV/텍스트로 내보내기 필요")
+        if not mask:
+            with open(path, "rb") as f:
+                R.add(f"  앞 16바이트(형식 식별용): {f.read(16).hex(' ')}")
+        return {"ok": False}
+    if kind == "excel":
+        R.flag("info", "확장자와 달리 엑셀 형식 파일 — Setting 파일 식별 규칙에서 이 확장자를 MX100 에 넣어야 읽힘")
+        return {"ok": False}
+
+    R.sub("1. 형식 판별 (앞 300줄)")
+    st = srv._sniff_table(str(path), enc_hint)
+    if st is None:
+        R.flag("err", "표 형태(구분자로 나뉜 열 + 숫자 데이터 줄)를 찾지 못함 — 앱에서 읽지 않음")
+        lines, enc = srv._read_head_lines(str(path), enc_hint, 8)
+        R.add(f"  인코딩 {enc}")
+        for i, ln in enumerate(lines[:8]):     # 값 없이 줄 모양만
+            R.add(f"  {i + 1}번째 줄: {len(ln)}자, 탭 {ln.count(chr(9))} · 쉼표 {ln.count(',')} · "
+                  f"세미콜론 {ln.count(';')} · 공백 {ln.count(' ')}")
+        if not mask and lines:
+            R.add(f"  첫 줄(형식 식별용): {lines[0][:80]}")
+        return {"ok": False}
+    sep_name = srv._SEP_NAMES.get(st["sep"], repr(st["sep"]))
+    R.add(f"  인코딩 {st['enc']} | 구분자 {sep_name} | 소수점 '{st['dec']}'")
+    R.add(f"  헤더 {st['header'] + 1}번째 줄" if st["header"] is not None else "  헤더 줄 없음 → 열 이름 Col1, Col2 …")
+    R.add(f"  앞쪽 설명 {st['preamble']}줄 | 헤더 아래 단위·보조 줄 {st['units']}개 | "
+          f"데이터 시작 {st['data_line'] + 1}번째 줄 | 데이터 {st['ncols']}칸")
+    if st["dt_merge"]:
+        R.flag("info", "공백 구분이라 날짜·시각이 두 칸으로 갈라져 있음 → 한 칸으로 합쳐 읽음")
+    if not mask:
+        R.add(f"  첫 줄(형식 식별용): {st['first']}")
+        R.add(f"  열 이름: {', '.join(st['names'][:60])}{' …' if len(st['names']) > 60 else ''}")
+
+    R.sub("2. 읽기 (앱과 같은 경로)")
+    srv._READ_NOTES.clear()
+    t0 = time.perf_counter()
+    try:
+        df, _ = quiet(srv.read_source_csv, str(path), fr, "nidaq", 0)
+    except Exception as e:
+        R.flag("err", f"읽기 중 예외: {type(e).__name__}: {e}")
+        return {"ok": False}
+    for n in srv._READ_NOTES:
+        R.add(f"  · {hide(n.strip())}")
+    if df is None or df.empty:
+        R.flag("err", "읽기 결과가 비어 있음")
+        return {"ok": False}
+    R.add(f"  {len(df):,}행 × {len(df.columns)}열 | 읽기 {time.perf_counter() - t0:.1f}s")
+
+    R.sub("3. 시간 축")
+    raw_t = srv._pick_time_col(df.columns)
+    ni, lines = quiet(srv._prep_generic_time, df.copy(), "NIDAQ")
+    for ln in lines:
+        R.add(f"  · {hide(ln.strip())}")
+    R.add(f"  시간 열 {hide(repr(str(raw_t if raw_t is not None else df.columns[0])))} — 원본 형식 "
+          f"{time_kind(df[raw_t].iloc[0] if raw_t is not None else df.iloc[0, 0])}")
+    t = ni["Time"]
+    if not pd.api.types.is_datetime64_any_dtype(t):
+        try:
+            t = pd.to_datetime(t, errors="coerce", format="mixed")
+        except (TypeError, ValueError):
+            t = pd.to_datetime(t, errors="coerce")
+    ok = t.notna().mean() if len(t) else 0
+    if ok < 0.9:
+        R.flag("err" if ok < 0.5 else "warn", f"시간으로 해석되는 행 {ok * 100:.0f}% — 나머지 행은 병합에서 빠짐")
+    tv = t.dropna()
+    if len(tv) > 1:
+        d = tv.diff().dt.total_seconds().dropna()
+        back = int((d < 0).sum())
+        R.add(f"  간격 중앙값 {d.median():g}초 | 길이 {(tv.iloc[-1] - tv.iloc[0]).total_seconds() / 60:.1f}분"
+              f"{f' | 시간이 줄어드는 곳 {back}회(자정 넘김이면 정상 처리)' if back else ''}")
+        if d.median() > 1.5:
+            R.flag("info", f"측정 간격이 {d.median():g}초 — 병합 때 1초 격자에 맞춰 보간됨")
+
+    R.sub("4. 열")
+    num = ni.drop(columns=["Time"]).apply(pd.to_numeric, errors="coerce")
+    empty = [c for c in num.columns if num[c].isna().all()]
+    const = [c for c in num.columns if num[c].notna().any() and num[c].nunique() == 1]
+    R.add(f"  숫자 열 {len(num.columns) - len(empty)}개 | 값이 전부 비거나 문자인 열 {len(empty)}개 | 값이 한 가지인 열 {len(const)}개")
+    if empty and not mask:
+        R.add(f"    비거나 문자인 열: {', '.join(map(str, empty[:20]))}")
+
+    # 케이스 폴더 안에서 어느 소스로 분류되는지 (확장자 규칙 → 없으면 내용 판별)
+    rules = active_rules(cfg, fr)
+    nm = path.name.lower()
+    owner = [k for k in ("mx100", "nidaq", "ams", "br")
+             if k in rules and any(nm.endswith(e.lower()) for e in (rules[k].get("extensions") or []))]
+    if owner:
+        R.flag("info", f"식별 규칙상 {owner[0].upper()} 확장자 → 케이스 폴더에서 {owner[0].upper()} 로 분류")
+    elif nm.endswith(srv._GENERIC_TEXT_EXTS):
+        src, why = srv._auto_text_source(path, rules)
+        R.flag("ok" if src else "warn", f"케이스 폴더에서 → {src.upper() if src else '미분류'} ({why})")
+    return {"ok": True}
+
+
+def active_rules(cfg: dict, fr: dict) -> dict:
+    act = None
+    for sec in cfg.values():
+        if isinstance(sec, dict) and "data_sources" in sec:
+            act = {s.lower() for s in (sec["data_sources"] or [])}
+    return {k: v for k, v in (fr or {}).items() if act is None or k in act}
+
+
 def diagnose_case(R: Report, folder: Path, label: str, srv, pre, cfg, fr, mask: bool, counter: dict):
     R.ctx = label
     R.h(f"케이스 폴더: {label}")
@@ -468,14 +584,28 @@ def diagnose_case(R: Report, folder: Path, label: str, srv, pre, cfg, fr, mask: 
     except Exception as e:
         R.flag("err", f"파일 분류 실패: {type(e).__name__}: {e}")
         return
+    names = sorted((x.name for x in folder.iterdir() if x.is_file()), key=len, reverse=True)
     for ln in lines:
         if "내용 판별" in ln or "미분류" in ln:
-            R.add(f"  · {ln.strip().replace(str(folder), label)}")
+            ln = ln.strip().replace(str(folder), label)
+            if mask:
+                for k, nm in enumerate(names):
+                    ln = ln.replace(nm, f"파일#{k + 1}")
+            R.add(f"  · {ln}")
     counts = {k: len(v) for k, v in files.items()}
     R.add("  분류 결과: " + ", ".join(f"{k.upper()} {v}개" for k, v in counts.items()))
+    # AMS 외 계측 파일(NIDAQ: .tsv/.dat 등) — 형식·시간 축 요약
+    for fn in files.get("nidaq", []):
+        counter["dat"] = counter.get("dat", 0) + 1
+        lab = f"DAT#{counter['dat']}" if mask else f"{label}/{fn}"
+        diagnose_table(R, folder / fn, lab, srv, cfg, fr, mask)
+    R.ctx = label
     ams = files.get("ams", [])
     if not ams:
-        R.flag("warn", "AMS 로 인식된 파일 없음 — 파일명/확장자/헤더 확인 필요")
+        if any(counts.values()):
+            R.flag("info", "AMS 로 인식된 파일 없음 (다른 소스 파일만 있음)")
+        else:
+            R.flag("warn", "AMS 로 인식된 파일 없음 — 파일명/확장자/헤더 확인 필요")
         return
     present = {k: v for k, v in counts.items() if v}
     if len(set(present.values())) > 1:
@@ -520,7 +650,7 @@ def main(argv: list[str]) -> int:
     cfg = srv.DEFAULT_CFG
     fr = cfg.get("file_rules", {}) or {}
 
-    R.add("HPWD Data Manager — AMS 진단 리포트")
+    R.add("HPWD Data Manager — 데이터 진단 리포트")
     R.add(f"생성 {datetime.datetime.now():%Y-%m-%d %H:%M:%S} | 앱 {git_rev()} | "
           f"Python {sys.version.split()[0]} | pandas {pd.__version__}")
     R.add(f"AMS 설정: 스킵 행 {(fr.get('ams') or {}).get('skip_rows')}, "
@@ -534,12 +664,18 @@ def main(argv: list[str]) -> int:
             R.flag("err", f"경로 없음: {a}")
             continue
         try:
-            if p.is_file():
+            if p.is_file() and p.suffix.lower() != ".csv":
+                # .dat/.txt/.tsv 등 — 형식(구분자·헤더·단위 줄·시간 축) 요약
+                counter["dat"] = counter.get("dat", 0) + 1
+                lab = f"DAT#{counter['dat']}" if mask else p.name
+                diagnose_table(R, p, lab, srv, cfg, fr, mask)
+            elif p.is_file():
                 counter["ams"] += 1
                 lab = f"AMS#{counter['ams']}" if mask else p.name
                 diagnose_ams(R, p, lab, srv, pre, cfg, fr)
             else:
-                has_csv = any(x.suffix.lower() in (".csv", ".tsv") for x in p.iterdir() if x.is_file())
+                has_csv = any(x.suffix.lower() in (".csv", ".tsv", ".dat", ".txt")
+                              for x in p.iterdir() if x.is_file())
                 cases = [p] if has_csv else sorted(x for x in p.iterdir() if x.is_dir())
                 for c in cases:
                     counter["case"] += 1

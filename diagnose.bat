@@ -1,5 +1,5 @@
 @echo off
-title HPWD - AMS Diagnose
+title HPWD - Data Diagnose
 pushd "%~dp0" 2>nul
 if errorlevel 1 goto NOCD
 
@@ -12,7 +12,7 @@ goto DONE
 
 :ASK
 echo.
-echo  Drag and drop an AMS csv file or a case folder onto diagnose.bat,
+echo  Drag and drop an AMS csv / .dat file or a case folder onto diagnose.bat,
 echo  or paste the path below and press Enter.
 echo.
 set "TARGET="
