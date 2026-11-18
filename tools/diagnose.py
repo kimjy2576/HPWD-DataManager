@@ -9,6 +9,8 @@ HPWD Data Manager — 데이터 진단 도구 (AMS .csv / 계측 .dat·.txt·.ts
 
 사용:
   python tools/diagnose.py <AMS.csv | 계측.dat | 케이스폴더 | 상위폴더> [...]
+  AMS 바이너리 .dat 는 같은 폴더에 같은 이름의 CSV(AMS 프로그램에서 내보낸 같은 측정)가 있으면
+  둘을 비교해 형식을 학습하고 config/ams_dat_formats/ 에 저장한다 → 이후 앱이 .dat 를 바로 읽음.
   python tools/diagnose.py <경로> --mask      파일/폴더 이름 가리기
   또는 diagnose.bat 위에 파일/폴더를 끌어다 놓기
 
@@ -564,6 +566,96 @@ def diagnose_table(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool) 
     return {"ok": True}
 
 
+def csv_partner(dat: Path, extra: list | None = None) -> Path | None:
+    """.dat 와 짝이 되는 'AMS 프로그램이 내보낸 같은 측정의 CSV' — 같은 폴더·같은 이름, 아니면 함께 끌어온 CSV 하나."""
+    same = dat.with_suffix(".csv")
+    if same.is_file():
+        return same
+    for c in dat.parent.glob("*"):
+        if c.suffix.lower() == ".csv" and c.stem.lower() == dat.stem.lower():
+            return c
+    cs = [Path(x) for x in (extra or []) if Path(x).suffix.lower() == ".csv"]
+    return cs[0] if len(cs) == 1 else None
+
+
+def diagnose_binary(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool, partner: Path | None) -> dict:
+    """바이너리 .dat — 구조 첫인상, 학습된 AMS 형식과 맞는지, (짝 CSV 가 있으면) 형식 학습."""
+    import ams_dat as A
+
+    R.ctx = label
+    R.h(f"바이너리 파일: {label}")
+    buf = A.read_bytes(path)
+    fl = A.first_look(buf)
+    R.add(f"  크기 {len(buf) / 1e6:.2f} MB | 엔트로피 {fl['entropy']:.2f} 비트/바이트"
+          f"{' (압축·암호화 수준)' if fl['entropy'] > 7.5 else ''}"
+          + (f" | 형식 서명: {fl['sig']}" if fl["sig"] else ""))
+    if not mask:
+        R.add(f"  앞 16바이트: {fl['head_hex']}")
+    if fl["period"]:
+        R.add(f"  같은 길이 기록 반복: {fl['period']['p']}바이트 × {fl['records']:,}개 "
+              f"(기록 시작 {fl['start']}바이트, 끝에 남는 {fl['tail']}바이트)")
+    else:
+        R.add("  같은 길이 기록이 반복되는 구조는 안 보임")
+    if fl["strings"] and not mask:
+        R.add("  앞부분 글자: " + " | ".join(f"@{o} {t[:30]}" for o, t, _ in fl["strings"][:12]))
+
+    sp, st = A.find_spec(path, head=buf)
+    if sp is not None:
+        df, lines = quiet(A.decode, buf, sp, st)
+        R.flag("ok", f"학습된 AMS 형식({sp.get('_file')})과 일치 → 앱에서 AMS 로 읽힘: {len(df):,}행 × {len(df.columns)}열")
+        miss = [c for c in sp["csv_columns"] if c not in df.columns]
+        if miss:
+            R.add(f"    형식 정보에 위치가 없는 열 {len(miss)}개" + ("" if mask else f": {', '.join(miss[:15])}"))
+        if partner is None:
+            return {"ok": True}
+
+    if partner is None:
+        R.flag("info", "AMS 프로그램에서 이 .dat 를 CSV 로 내보낸 파일을 같은 폴더에 같은 이름(.csv)으로 두고 "
+                       "다시 실행하면 형식을 학습함 (한 번만 하면 같은 형식의 .dat 는 앱이 바로 읽음)")
+        return {"ok": False}
+
+    R.sub("AMS 형식 학습 (.dat ↔ 같은 측정의 CSV)")
+    R.add(f"  짝 CSV: {'(이름 가림)' if mask else partner.name}")
+    srv._READ_NOTES.clear()
+    df, _ = quiet(srv.read_source_csv, str(partner), fr, "ams", 1)
+    if df is None or df.empty:
+        R.flag("err", "짝 CSV 를 읽지 못함")
+        return {"ok": False}
+    t0 = time.perf_counter()
+    res, _ = quiet(A.learn, buf, df)
+    for n in res["notes"]:
+        R.add(f"  · {n}")
+    v = res.get("verify")
+    if v:
+        R.add(f"  검증: 값 일치 {v['overall'] * 100:.3f}% | 시각 일치 {v['time_ok'] * 100:.2f}% ({v['rows']:,}행) "
+              f"| 학습 {time.perf_counter() - t0:.1f}s")
+        sp_new = res["spec"]
+        R.add(f"  찾은 열 {len(sp_new['columns'])}개 + 상태 코드 열 {len(sp_new['codes'])}개 / "
+              f"값이 변하는 열 중 {res['coverage'] * 100:.0f}%")
+        low = {k: x for k, x in v["cols"].items() if x < 0.999}
+        if low:
+            R.add("  일치율 낮은 열: " + ", ".join(f"{'열' if mask else k} {x * 100:.1f}%" for k, x in list(low.items())[:10]))
+        if res.get("unmapped"):
+            cst = set(res.get("unmapped_const", []))
+            R.add(f"  위치를 못 찾은 열 {len(res['unmapped'])}개 (그중 학습 파일에서 값이 일정했던 열 {len(cst)}개)"
+                  + ("" if mask else ": " + ", ".join(res["unmapped"][:20])))
+            if cst:
+                R.flag("info", "값이 일정했던 열은 위치를 특정할 수 없음 — 그 값이 변하는 다른 측정의 (.dat, .csv) "
+                               "쌍으로 한 번 더 학습하면 형식 정보에 추가됨")
+        lr = sp_new["learned"]
+        if lr["sign_unsure"]:
+            R.add(f"  ± 부호를 학습 파일로 확정 못 한 열 {len(lr['sign_unsure'])}개 → 온도류 이름은 ±, 나머지는 + 로 가정")
+        if lr["width_unsure"]:
+            R.add(f"  1/2바이트 폭을 추정한 열 {len(lr['width_unsure'])}개 (옆 바이트가 늘 0)")
+    if res["ok"]:
+        out = A.save_spec(res["spec"])
+        R.flag("ok", f"형식 학습 성공 → {out.relative_to(ROOT) if out.is_relative_to(ROOT) else out} 저장. "
+                     f"이제 앱이 같은 형식의 AMS .dat 를 CSV 없이 바로 읽음 (서버 재시작 불필요)")
+    else:
+        R.flag("err", f"형식 학습 실패 — {res['why']}")
+    return {"ok": bool(res["ok"])}
+
+
 def active_rules(cfg: dict, fr: dict) -> dict:
     act = None
     for sec in cfg.values():
@@ -599,8 +691,15 @@ def diagnose_case(R: Report, folder: Path, label: str, srv, pre, cfg, fr, mask: 
         counter["dat"] = counter.get("dat", 0) + 1
         lab = f"DAT#{counter['dat']}" if mask else f"{label}/{fn}"
         diagnose_table(R, folder / fn, lab, srv, cfg, fr, mask)
+    # 바이너리 .dat (AMS 형식으로 잡힌 것·못 잡힌 것 모두) — 구조·형식 일치, 짝 CSV 가 있으면 학습
+    for x in sorted(folder.iterdir()):
+        if x.is_file() and x.suffix.lower() == ".dat" and srv._file_kind(str(x))[0] == "binary":
+            counter["dat"] = counter.get("dat", 0) + 1
+            lab = f"DAT#{counter['dat']}" if mask else f"{label}/{x.name}"
+            diagnose_binary(R, x, lab, srv, cfg, fr, mask, csv_partner(x))
     R.ctx = label
-    ams = files.get("ams", [])
+    ams = [fn for fn in files.get("ams", []) if not (fn.lower().endswith(".dat")
+                                                     and srv._file_kind(str(folder / fn))[0] == "binary")]
     if not ams:
         if any(counts.values()):
             R.flag("info", "AMS 로 인식된 파일 없음 (다른 소스 파일만 있음)")
@@ -658,13 +757,26 @@ def main(argv: list[str]) -> int:
     R.add("※ 원본 데이터 값은 포함하지 않음 (개수·칸 수·시간 길이·주요 변수 집계값만)")
 
     counter = {"ams": 0, "case": 0}
-    for a in args:
-        p = Path(a.strip().strip('"'))
+    paths = [Path(a.strip().strip('"')) for a in args]
+    # 바이너리 .dat 와 함께 끌어온 CSV 는 '형식 학습용 짝'으로 쓰고 따로 진단하지 않음
+    used_csv = set()
+    for p in paths:
+        if p.is_file() and p.suffix.lower() == ".dat" and srv._file_kind(str(p))[0] == "binary":
+            c = csv_partner(p, [str(x) for x in paths])
+            if c is not None:
+                used_csv.add(c.resolve())
+    for a, p in zip(args, paths):
         if not p.exists():
             R.flag("err", f"경로 없음: {a}")
             continue
+        if p.is_file() and p.resolve() in used_csv:
+            continue
         try:
-            if p.is_file() and p.suffix.lower() != ".csv":
+            if p.is_file() and p.suffix.lower() == ".dat" and srv._file_kind(str(p))[0] == "binary":
+                counter["dat"] = counter.get("dat", 0) + 1
+                lab = f"DAT#{counter['dat']}" if mask else p.name
+                diagnose_binary(R, p, lab, srv, cfg, fr, mask, csv_partner(p, [str(x) for x in paths]))
+            elif p.is_file() and p.suffix.lower() != ".csv":
                 # .dat/.txt/.tsv 등 — 형식(구분자·헤더·단위 줄·시간 축) 요약
                 counter["dat"] = counter.get("dat", 0) + 1
                 lab = f"DAT#{counter['dat']}" if mask else p.name

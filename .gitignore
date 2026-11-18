@@ -7,3 +7,6 @@ results/
 dist/
 build/
 pyarmor.bug.log
+
+# AMS .dat 학습 형식 (PC/서버마다 따로)
+config/ams_dat_formats/

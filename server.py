@@ -4,6 +4,7 @@ server.py — FastAPI 백엔드 (v5 — Merge / Calculation 분리)
 import os, sys, uuid, time, traceback, re, csv
 from collections import Counter
 from pathlib import Path
+import ams_dat
 from typing import Optional
 
 import yaml
@@ -471,8 +472,8 @@ def _read_generic_table(path, file_rules=None, src_key="nidaq", default_skip=0, 
 
     kind, enc_hint = _file_kind(path)
     if kind == "binary":
-        note("⚠️ 텍스트가 아닌 바이너리 파일이라 읽을 수 없음 — 측정 프로그램에서 CSV/텍스트로 "
-             "내보내기 필요 (diagnose.bat 리포트로 형식 확인 가능)")
+        note("⚠️ 텍스트가 아닌 바이너리 파일이라 읽을 수 없음 — AMS 프로그램 .dat 이면 diagnose.bat 으로 "
+             "형식을 학습시키면 AMS 로 읽힘, 다른 장비면 CSV/텍스트로 내보내기 필요")
         return pd.DataFrame()
     if kind == "excel":
         note(f"⚠️ 엑셀 형식 파일 — {src_key.upper()} 는 텍스트 표만 읽음 (엑셀은 MX100 확장자 규칙으로)")
@@ -570,6 +571,16 @@ def read_source_csv(path, file_rules, src_key, default_skip=1, nrows=None):
     .csv/.tsv 가 아닌 확장자(.dat 등)는 내용으로 구조를 판별하는 _read_generic_table 로.
     """
     path = str(path)
+    if os.path.splitext(path)[1].lower() not in (".csv", ".tsv") and src_key == "ams" \
+            and _file_kind(path)[0] == "binary":
+        def _note(msg):
+            print(msg)
+            _READ_NOTES.append(msg)
+        try:
+            return ams_dat.read_dat(path, nrows=nrows, log=_note)
+        except Exception as e:
+            _note(f"  [ams_dat] {os.path.basename(path)}: ⚠️ 읽기 실패: {type(e).__name__}: {str(e)[:150]}")
+            return pd.DataFrame()
     if os.path.splitext(path)[1].lower() not in (".csv", ".tsv"):
         # AMS/BR 로그가 .dat 로 저장된 경우: 쉼표·탭 구분이면 기존 csv 경로로 읽어
         # .csv 와 똑같은 열 이름(쉼표 포함 헤더 보정 등)을 만든다 → 이름 매핑·변수 표가 그대로 맞음
@@ -1191,7 +1202,17 @@ def _auto_text_source(path: Path, file_rules: dict):
     BR 은 열 이름 특징('t_air_', 'p_comp' 등)이 일반 계측 채널 이름과 겹쳐 자동으로 고르지 않음."""
     kind, enc = _file_kind(path)
     if kind == "binary":
-        return None, "텍스트가 아닌 바이너리 파일 — 측정 프로그램에서 CSV/텍스트로 내보내야 읽을 수 있음"
+        try:
+            size = os.path.getsize(path)
+            sp, _ = ams_dat.find_spec(path, head=ams_dat.read_bytes(path, 2 << 20), size=size)
+        except Exception:
+            sp = None
+        if sp is not None:
+            if "ams" in file_rules:
+                return "ams", f"AMS 바이너리 — 학습한 형식 {sp.get('_file', '')}"
+            return None, "AMS 바이너리지만 AMS 소스가 꺼져 있음 — Setting 의 사용 소스에서 AMS 를 켜면 병합됨"
+        return None, ("바이너리 파일 — AMS 프로그램 .dat 이면 diagnose.bat 에 이 .dat 와 같은 측정을 AMS 에서 "
+                      "CSV 로 내보낸 파일(같은 이름 .csv)을 함께 끌어놓아 형식을 한 번 학습시키면 읽힘")
     if kind == "excel":
         return None, "엑셀 형식 — MX100 확장자 규칙에 넣으면 MX100 으로 읽음"
     if kind != "text":

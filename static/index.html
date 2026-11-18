@@ -2918,7 +2918,7 @@ return(<div><div className="fg"><div>
 </div>
 
 <div className="cd"><div className="ct">파일 식별 규칙</div>
-<div style={{fontSize:11,color:'var(--tx3)',marginBottom:8}}>각 소스별로 파일을 구별하는 규칙을 설정합니다. 우선순위: MX100 → NIDAQ → AMS → BR (마지막 폴백)<br/>규칙에 안 맞는 <b>.dat</b> 는 내용을 보고 판별합니다 — AMS 형식이면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 병합. .csv/.tsv 가 아닌 확장자(.dat, .txt 등)는 구분자·헤더 줄·단위 줄·인코딩을 자동으로 판별해 읽습니다 (.txt 등은 위 확장자 칸에 넣어야 사용)</div>
+<div style={{fontSize:11,color:'var(--tx3)',marginBottom:8}}>각 소스별로 파일을 구별하는 규칙을 설정합니다. 우선순위: MX100 → NIDAQ → AMS → BR (마지막 폴백)<br/>규칙에 안 맞는 <b>.dat</b> 는 내용을 보고 판별합니다 — AMS 형식이면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 병합. .csv/.tsv 가 아닌 확장자(.dat, .txt 등)는 구분자·헤더 줄·단위 줄·인코딩을 자동으로 판별해 읽습니다 (.txt 등은 위 확장자 칸에 넣어야 사용)<br/><b>AMS 프로그램 바이너리 .dat</b> 는 diagnose.bat 에 .dat 와 같은 측정의 CSV(같은 이름)를 함께 끌어놓아 형식을 한 번 학습시키면 AMS 로 읽습니다</div>
 {['mx100','nidaq','ams','br'].map(src=>{
   const rule=l?.file_rules?.[src]||{};
   const setRule=(k,v)=>{const fr=JSON.parse(JSON.stringify(l?.file_rules||{}));if(!fr[src])fr[src]={};fr[src][k]=v;s('file_rules',fr)};
