@@ -472,8 +472,8 @@ def _read_generic_table(path, file_rules=None, src_key="nidaq", default_skip=0, 
 
     kind, enc_hint = _file_kind(path)
     if kind == "binary":
-        note("⚠️ 텍스트가 아닌 바이너리 파일이라 읽을 수 없음 — AMS 프로그램 .dat 이면 diagnose.bat 으로 "
-             "형식을 학습시키면 AMS 로 읽힘, 다른 장비면 CSV/텍스트로 내보내기 필요")
+        note("⚠️ 텍스트가 아닌 바이너리 파일이라 읽을 수 없음 — AMS 프로그램 .dat 이면 케이스 확정 후 "
+             "'파일 선택' → [형식 학습] 을 한 번 하면 AMS 로 읽힘, 다른 장비면 CSV/텍스트로 내보내기 필요")
         return pd.DataFrame()
     if kind == "excel":
         note(f"⚠️ 엑셀 형식 파일 — {src_key.upper()} 는 텍스트 표만 읽음 (엑셀은 MX100 확장자 규칙으로)")
@@ -1130,27 +1130,175 @@ def browse_directory(req: BrowseRequest):
             "cases": [i["name"] for i in items if i["is_dir"]]}
 
 
+_SRC_KEYS = ("br", "ams", "mx100", "nidaq")
+_DATA_EXTS = (".csv", ".tsv", ".dat", ".txt", ".xls", ".xlsx", ".xlsm")
+_GEN_TAGS = ("merged", "calc", "result", "formula", ".cache")
+_TAG_TAIL = re.compile(r"(_br|_ams|_temp)$", re.I)
+
+
+def _stem_key(name: str) -> str:
+    """'test_br.csv' → 'test' — 앱이 붙이는 _br/_ams/_temp 를 떼고 비교 (같은 측정 짝 찾기)."""
+    return _TAG_TAIL.sub("", Path(name).stem.lower())
+
+
+def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
+                  overrides: dict | None = None, pairs: dict | None = None):
+    """케이스 폴더의 파일 판별 + 사용자 선택 적용.
+
+    overrides: {파일 이름: 소스키 | None(사용 안 함)} — 화면에서 고른 것. 자동 판별보다 우선.
+    pairs: {AMS .dat: 같은 측정 CSV} — 앱에서 형식을 학습한 짝.
+    같은 측정의 AMS CSV 가 함께 있는 AMS 바이너리 .dat 는 기본으로 뺀다 (같은 데이터가 두 번 병합되지 않게).
+    반환: (소스별 파일 {br:[…], …}, 미분류 [{file, why}], 화면용 파일 목록 [{file, size, kind, auto, dflt, src, why, learn, csvs}])"""
+    um: list = []
+    cf = _classify_files(case_dir, file_rules, sources, unmatched=um)
+    auto = {f: k for k, lst in cf.items() for f in lst}
+    why = {u["file"]: u["why"] for u in um}
+    ams_csv = {_stem_key(f): f for f in cf.get("ams", []) if f.lower().endswith(".csv")}
+    for f in list(cf.get("ams", [])):
+        if not f.lower().endswith(".dat"):
+            continue
+        twin = (pairs or {}).get(f) if (pairs or {}).get(f) in cf.get("ams", []) else ams_csv.get(_stem_key(f))
+        if twin:
+            cf["ams"].remove(f)
+            why[f] = f"같은 측정의 CSV({twin})가 함께 있어 기본으로 뺌 — 체크하면 .dat 를 사용"
+    dflt = {f: k for k, lst in cf.items() for f in lst}
+    ov = {}
+    for f, src in (overrides or {}).items():
+        if not (case_dir / f).is_file():
+            continue
+        for k in cf:
+            if f in cf[k]:
+                cf[k].remove(f)
+        if src in cf:
+            cf[src] = sorted(cf[src] + [f])
+        ov[f] = src
+    if ov:
+        um = [u for u in um if u["file"] not in ov]
+        print(f"  [case] {case_dir.name}: 화면에서 고른 파일 {len(ov)}개 적용 "
+              + ", ".join(f"{f}→{v.upper() if v else '사용 안 함'}" for f, v in list(ov.items())[:6]))
+    eff = {f: k for k, lst in cf.items() for f in lst}
+    csvs = sorted(x.name for x in case_dir.iterdir() if x.is_file() and x.suffix.lower() == ".csv"
+                  and not any(t in x.name.lower() for t in _GEN_TAGS))
+    entries = []
+    for x in sorted(case_dir.iterdir()):
+        if not x.is_file() or x.name.startswith("."):
+            continue
+        nl = x.name.lower()
+        if any(t in nl for t in _GEN_TAGS):
+            continue
+        if not (x.name in auto or x.name in why or nl.endswith(_DATA_EXTS) or x.name in ov):
+            continue
+        kind = _file_kind(str(x))[0] if nl.endswith(".dat") else ""
+        e = {"file": x.name, "size": x.stat().st_size, "kind": kind, "auto": auto.get(x.name),
+             "dflt": dflt.get(x.name), "src": eff.get(x.name), "why": why.get(x.name, "")}
+        if not e["auto"] and not e["why"]:
+            e["why"] = "자동 판별 대상 아님 — 쓰려면 체크하고 소스를 고르세요"
+        if nl.endswith(".dat") and kind in ("binary", "excel") and e["auto"] != "ams":
+            e["learn"] = True
+            k0 = _stem_key(x.name)
+            e["csvs"] = sorted(csvs, key=lambda c: (_stem_key(c) != k0, auto.get(c) != "ams", c))
+        entries.append(e)
+    return cf, um, entries
+
+
+class CaseFilesReq(BaseModel):
+    session_id: str
+    case: str
+    overrides: dict = {}
+
+
+@app.post("/api/case-files")
+def set_case_files(req: CaseFilesReq):
+    """화면에서 고른 케이스 파일(사용/제외·소스) 저장 → 변수 스캔·Merge 가 이대로 사용."""
+    s = sessions.get(req.session_id)
+    if not s:
+        raise HTTPException(404, "세션 없음 — 케이스를 다시 확정하세요")
+    if req.case not in s.get("case_files", {}):
+        raise HTTPException(404, f"케이스 없음: {req.case}")
+    case_dir = Path(s["category_path"]) / req.case
+    ren = s.get("renamed", {}).get(req.case, {})     # Merge 가 _br 등을 붙여 이름을 바꿨으면 화면의 옛 이름을 새 이름으로
+    ov = {ren.get(Path(str(k)).name, Path(str(k)).name): (v if v in _SRC_KEYS else None)
+          for k, v in (req.overrides or {}).items()}
+    s.setdefault("overrides", {})[req.case] = ov
+    cf, um, entries = _case_entries(case_dir, DEFAULT_CFG.get("file_rules"),
+                                    DEFAULT_CFG.get("processing", {}).get("data_sources"),
+                                    ov, s.get("pairs", {}).get(req.case))
+    s["case_files"][req.case] = cf
+    return {"case": req.case, "files": cf, "unmatched": um, "entries": entries}
+
+
+class AmsLearnReq(BaseModel):
+    session_id: str
+    case: str
+    dat: str
+    csv: str
+
+
+@app.post("/api/ams-dat/learn")
+def ams_dat_learn(req: AmsLearnReq):
+    """앱 안에서 AMS .dat 형식 학습 — 케이스 폴더의 .dat 와 같은 측정의 CSV 를 비교 (tools/diagnose.py 와 같은 학습)."""
+    s = sessions.get(req.session_id)
+    if not s:
+        raise HTTPException(404, "세션 없음 — 케이스를 다시 확정하세요")
+    case_dir = Path(s["category_path"]) / req.case
+    ren = s.get("renamed", {}).get(req.case, {})
+    dat = case_dir / ren.get(Path(req.dat).name, Path(req.dat).name)
+    if not dat.is_file():
+        raise HTTPException(404, f".dat 파일 없음: {req.dat}")
+    cp = Path(str(req.csv).strip().strip('"'))
+    if not cp.is_absolute():
+        cp = case_dir / ren.get(cp.name, cp.name)
+    if not cp.is_file():
+        raise HTTPException(404, f"CSV 파일 없음: {req.csv}")
+    fr = DEFAULT_CFG.get("file_rules", {})
+    _READ_NOTES.clear()
+    df = read_source_csv(str(cp), fr, "ams", 1)
+    _READ_NOTES.clear()
+    if df is None or df.empty:
+        raise HTTPException(400, f"CSV 를 읽지 못함: {cp.name}")
+    t0 = time.perf_counter()
+    res = ams_dat.learn(ams_dat.read_bytes(dat), df)
+    fl = res.get("first_look") or {}
+    out = {"ok": bool(res["ok"]), "why": res.get("why", ""), "notes": res.get("notes", []),
+           "sec": round(time.perf_counter() - t0, 1),
+           "look": {"size": fl.get("size"), "sig": fl.get("sig"), "entropy": round(float(fl.get("entropy", 0)), 2),
+                    "record": (fl.get("period") or {}).get("p"), "records": fl.get("records")}}
+    v = res.get("verify")
+    if v:
+        sp = res["spec"]
+        out.update(value_pct=round(v["overall"] * 100, 3), time_pct=round(v["time_ok"] * 100, 2), rows=v["rows"],
+                   columns=len(sp["columns"]), codes=len(sp["codes"]), unmapped=res.get("unmapped", []),
+                   unmapped_const=res.get("unmapped_const", []), coverage=round(res.get("coverage", 0) * 100))
+    if res["ok"]:
+        out["spec"] = ams_dat.save_spec(res["spec"]).name
+        if cp.parent == case_dir:
+            s.setdefault("pairs", {}).setdefault(req.case, {})[dat.name] = cp.name
+    print(f"  [ams_dat] 형식 학습 {dat.name} ↔ {cp.name}: {'성공 → ' + out['spec'] if out['ok'] else '실패 — ' + out['why']}")
+    return out
+
+
 @app.post("/api/select")
 def select_cases(req: SelectRequest):
     category = Path(req.category_path)
     if not category.exists(): raise HTTPException(404, f"경로 없음: {req.category_path}")
     sid = str(uuid.uuid4())[:8]
-    case_files, unmatched = {}, {}
+    case_files, unmatched, entries = {}, {}, {}
     for case in req.case_names:
         case_dir = category / case
         if not case_dir.is_dir(): continue
-        um = []
-        case_files[case] = _classify_files(case_dir, DEFAULT_CFG.get("file_rules"),
-                                           DEFAULT_CFG.get("processing",{}).get("data_sources"), unmatched=um)
+        cf, um, ent = _case_entries(case_dir, DEFAULT_CFG.get("file_rules"),
+                                    DEFAULT_CFG.get("processing",{}).get("data_sources"))
+        case_files[case], entries[case] = cf, ent
         if um:
             unmatched[case] = um
     if not case_files: raise HTTPException(400, "유효한 케이스 없음")
     sessions[sid] = {
         "status": "ready", "progress": 0, "log": [], "error": None,
         "category_path": str(category), "case_files": case_files,
+        "overrides": {}, "pairs": {},
         "merge_results": [], "calc_results": [],
     }
-    return {"session_id": sid, "cases": case_files, "unmatched": unmatched}
+    return {"session_id": sid, "cases": case_files, "unmatched": unmatched, "files": entries}
 
 
 def _peek_header(path: Path, skip_rows: int = 1) -> str:
@@ -1211,8 +1359,8 @@ def _auto_text_source(path: Path, file_rules: dict):
             if "ams" in file_rules:
                 return "ams", f"AMS 바이너리 — 학습한 형식 {sp.get('_file', '')}"
             return None, "AMS 바이너리지만 AMS 소스가 꺼져 있음 — Setting 의 사용 소스에서 AMS 를 켜면 병합됨"
-        return None, ("바이너리 파일 — AMS 프로그램 .dat 이면 diagnose.bat 에 이 .dat 와 같은 측정을 AMS 에서 "
-                      "CSV 로 내보낸 파일(같은 이름 .csv)을 함께 끌어놓아 형식을 한 번 학습시키면 읽힘")
+        return None, ("바이너리 파일 — AMS 프로그램 .dat 이면 '파일 선택'에서 같은 측정을 AMS 에서 내보낸 CSV 를 "
+                      "골라 [형식 학습] 을 한 번 누르면 읽힘")
     if kind == "excel":
         return None, "엑셀 형식 — MX100 확장자 규칙에 넣으면 MX100 으로 읽음"
     if kind != "text":
@@ -1324,8 +1472,9 @@ def scan_columns(req: BrowseRequest):
     # 첫 번째 케이스에서 샘플 읽기
     for case_name, cf in case_files.items():
         case_dir = category / case_name
-        # 최신 파일 목록으로 재분류
-        cf = _classify_files(case_dir, fr, active)
+        # 최신 파일 목록으로 재분류 + 화면에서 고른 파일(사용/제외·소스) 적용
+        cf = _case_entries(case_dir, fr, active, s.get("overrides", {}).get(case_name),
+                           s.get("pairs", {}).get(case_name))[0]
 
         def _scan_csv(src_key, label, skip=1):
             # Merge 와 같은 읽기 함수 사용 → 표에 보이는 이름 = merged 파일 컬럼 이름
@@ -1520,8 +1669,15 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
         plans = []
         for case_name in case_files:
             case_dir = category / case_name
-            rename_files_in_folder(str(case_dir))
-            cf = _classify_files(case_dir, cfg.get("file_rules"), sources)
+            ren = rename_files_in_folder(str(case_dir)) or {}
+            ov = {ren.get(k, k): v for k, v in (s.get("overrides", {}).get(case_name) or {}).items()}
+            pr = {ren.get(k, k): ren.get(v, v) for k, v in (s.get("pairs", {}).get(case_name) or {}).items()}
+            if ren:
+                s.setdefault("overrides", {})[case_name] = ov
+                s.setdefault("pairs", {})[case_name] = pr
+                s.setdefault("renamed", {}).setdefault(case_name, {}).update(ren)
+            cf = _case_entries(case_dir, cfg.get("file_rules"), sources, ov, pr)[0]
+            s["case_files"][case_name] = cf
             ref_eff, n = _plan_ref(cf)
             found = ", ".join(f"{k.upper()} {len(v)}개" for k, v in cf.items() if v) or "없음"
             if n == 0:

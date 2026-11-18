@@ -89,9 +89,37 @@ return(<div className="app"><div className="hdr" style={{display:'flex',alignIte
 function PathSelector({sid,setSid,setSt,onSessionReady}){
 const[path,setPath]=useState(localStorage.getItem('dryer_path')||'D:\\');
 const[cases,setCases]=useState([]);const[cf,setCf]=useState({});const[unm,setUnm]=useState({});const[sel,setSel]=useState(new Set());const[busy,setBusy]=useState(false);
+const[files,setFiles]=useState({});      // 케이스별 파일 목록 [{file,size,kind,auto,dflt,src,why,learn,csvs}]
+const[ovr,setOvr]=useState({});          // 화면에서 고른 것 {케이스:{파일:소스|null}}
+const[openC,setOpenC]=useState(new Set());
+const[lrn,setLrn]=useState({});          // AMS .dat 형식 학습 {케이스/파일:{csv,path,busy,res}}
 const browse=async()=>{setBusy(true);try{const r=await fetch(`${API}/api/browse`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const d=await r.json();if(!r.ok){alert(d.detail);setBusy(false);return}setCases(d.cases||[]);setPath(d.path);localStorage.setItem('dryer_path',d.path);setSel(new Set(d.cases||[]))}catch(e){alert(e.message)}setBusy(false)};
-const confirm=async()=>{if(!sel.size){alert('선택 없음');return}try{const r=await fetch(`${API}/api/select`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category_path:path,case_names:[...sel]})});const d=await r.json();if(!r.ok){alert(d.detail);return}setSid(d.session_id);setCf(d.cases||{});setUnm(d.unmatched||{});setSt({status:'ready',progress:0,log:[],merge_results:[],calc_results:[]});if(onSessionReady)onSessionReady(d.session_id,d.cases)}catch(e){alert(e.message)}};
+const confirm=async()=>{if(!sel.size){alert('선택 없음');return}try{const r=await fetch(`${API}/api/select`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category_path:path,case_names:[...sel]})});const d=await r.json();if(!r.ok){alert(d.detail);return}setSid(d.session_id);setCf(d.cases||{});setUnm(d.unmatched||{});setFiles(d.files||{});setOvr({});setLrn({});
+  setOpenC(new Set(Object.entries(d.files||{}).filter(([c,l])=>Object.values(d.cases?.[c]||{}).some(v=>v.length>1)||l.some(e=>e.learn)).map(([c])=>c).slice(0,3)));setSt({status:'ready',progress:0,log:[],merge_results:[],calc_results:[]});if(onSessionReady)onSessionReady(d.session_id,d.cases)}catch(e){alert(e.message)}};
 const tog=n=>{setSel(p=>{const s=new Set(p);s.has(n)?s.delete(n):s.add(n);return s})};
+// 파일 선택 저장 → 서버가 다시 판별해 소스별 목록·미분류·파일 목록을 돌려줌 (변수 스캔·Merge 가 이대로 사용)
+const applyCase=async(c,next)=>{setOvr(p=>({...p,[c]:next}));
+  try{const r=await fetch(`${API}/api/case-files`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,case:c,overrides:next})});
+  const d=await r.json();if(!r.ok){alert(d.detail);return}
+  setCf(p=>({...p,[c]:d.files}));setFiles(p=>({...p,[c]:d.entries}));
+  setUnm(p=>{const q={...p};if(d.unmatched?.length)q[c]=d.unmatched;else delete q[c];return q})}catch(e){alert(e.message)}};
+const guessSrc=e=>e.auto||(e.learn?'ams':/\.(xls|xlsx|xlsm)$/i.test(e.file)?'mx100':/\.csv$/i.test(e.file)?'br':'nidaq');
+const setFileSrc=(c,e,src)=>{const cur={...(ovr[c]||{})};if((src||null)===(e.dflt||null))delete cur[e.file];else cur[e.file]=src||null;
+  setFiles(p=>({...p,[c]:(p[c]||[]).map(x=>x.file===e.file?{...x,src:src||null}:x)}));   // 바로 반영 (서버 응답으로 다시 맞춤)
+  applyCase(c,cur)};
+const fmtB=b=>b>=1e6?(b/1e6).toFixed(1)+' MB':b>=1e3?Math.round(b/1e3)+' KB':(b||0)+' B';
+const learnDat=async(c,e)=>{const k=c+'/'+e.file;const L=lrn[k]||{};const pick=L.csv??(e.csvs?.[0]||'__path');
+  const csv=pick==='__path'?(L.path||'').trim():pick;
+  if(!csv){alert('짝 CSV(같은 측정을 AMS 프로그램에서 내보낸 파일)를 고르거나 경로를 입력하세요');return}
+  setLrn(p=>({...p,[k]:{...L,busy:true,res:null}}));
+  try{const r=await fetch(`${API}/api/ams-dat/learn`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,case:c,dat:e.file,csv})});
+    const d=await r.json();
+    setLrn(p=>({...p,[k]:{...L,busy:false,res:r.ok?d:{ok:false,why:d.detail}}}));
+    if(r.ok&&d.ok){   // 같은 형식의 .dat 가 다른 케이스에도 있을 수 있으니 전부 다시 판별
+      await applyCase(c,ovr[c]||{});
+      for(const c2 of Object.keys(files))if(c2!==c&&(files[c2]||[]).some(x=>/\.dat$/i.test(x.file)))await applyCase(c2,ovr[c2]||{});
+    }
+  }catch(err){setLrn(p=>({...p,[k]:{...L,busy:false,res:{ok:false,why:err.message}}}))}};
 return(<div className="cd"><div className="ct">데이터 경로</div>
 <div className="pr"><input className="pi" value={path} onChange={e=>setPath(e.target.value)} placeholder="D:\실험데이터" onKeyDown={e=>e.key==='Enter'&&browse()}/><button className="bt bp" onClick={browse} disabled={busy}>{busy?'탐색 중...':'경로 탐색'}</button></div>
 {cases.length>0&&<><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}><span className="it">{cases.length}개 케이스 — {sel.size}개 선택</span><div style={{display:'flex',gap:6}}><button className="bt bs" onClick={()=>setSel(new Set(cases))}>전체</button><button className="bt bs" onClick={()=>setSel(new Set())}>해제</button></div></div>
@@ -101,11 +129,49 @@ return(<div className="cd"><div className="ct">데이터 경로</div>
   {sid&&<span className="it">세션: {sid}</span>}
 </div>
 
-{/* 파일 분류 요약 */}
-{Object.keys(cf).length>0&&<div style={{marginTop:12}}>{Object.entries(cf).map(([c,f])=><div key={c} style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0',fontSize:12}}><span style={{color:'var(--tx2)',minWidth:200}}>{c}</span><div style={{display:'flex',gap:4}}>{f.br?.length>0&&<span className="ft fb" title={f.br.join('\n')}>BR×{f.br.length}</span>}{f.ams?.length>0&&<span className="ft fa" title={f.ams.join('\n')}>AMS×{f.ams.length}</span>}{f.mx100?.length>0&&<span className="ft fm" title={f.mx100.join('\n')}>MX×{f.mx100.length}</span>}{f.nidaq?.length>0&&<span title={f.nidaq.join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>NIDAQ×{f.nidaq.length}</span>}{unm[c]?.length>0&&<span title={unm[c].map(u=>`${u.file} — ${u.why}`).join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(234,179,8,.14)',color:'#b45309',cursor:'help'}}>미분류×{unm[c].length}</span>}</div></div>)}
+{/* 파일 분류 요약 + 케이스별 파일 선택 */}
+{Object.keys(cf).length>0&&<div style={{marginTop:12}}>{Object.entries(cf).map(([c,f])=>{const multi=Object.values(f).some(v=>v.length>1);const fl=files[c]||[];const op=openC.has(c);const nLearn=fl.filter(e=>e.learn).length;
+return<div key={c}>
+<div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0',fontSize:12}}><span style={{color:'var(--tx2)',minWidth:200}}>{c}</span><div style={{display:'flex',gap:4,alignItems:'center'}}>{f.br?.length>0&&<span className="ft fb" title={f.br.join('\n')}>BR×{f.br.length}</span>}{f.ams?.length>0&&<span className="ft fa" title={f.ams.join('\n')}>AMS×{f.ams.length}</span>}{f.mx100?.length>0&&<span className="ft fm" title={f.mx100.join('\n')}>MX×{f.mx100.length}</span>}{f.nidaq?.length>0&&<span title={f.nidaq.join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>NIDAQ×{f.nidaq.length}</span>}{unm[c]?.length>0&&<span title={unm[c].map(u=>`${u.file} — ${u.why}`).join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(234,179,8,.14)',color:'#b45309',cursor:'help'}}>미분류×{unm[c].length}</span>}
+  {fl.length>0&&<button className="bt bs" style={{fontSize:10,padding:'1px 8px',marginLeft:6}} onClick={()=>setOpenC(p=>{const q=new Set(p);q.has(c)?q.delete(c):q.add(c);return q})} title="이 케이스에서 쓸 파일과 소스를 고릅니다">파일 선택 {op?'▴':'▾'}</button>}
+  {multi&&<span style={{fontSize:10,color:'#b45309'}}>같은 소스 파일 여러 개 — BR·AMS 는 i번째 파일끼리 짝지어 병합</span>}
+  {nLearn>0&&!op&&<span style={{fontSize:10,color:'#b45309'}}>.dat {nLearn}개 형식 학습 필요</span>}
+  {Object.keys(ovr[c]||{}).length>0&&<span style={{fontSize:10,color:'var(--ac)'}}>직접 고름 {Object.keys(ovr[c]).length}개</span>}
+</div></div>
+{op&&<div style={{margin:'2px 0 8px 12px',padding:'6px 10px',borderLeft:'2px solid var(--bd)',fontSize:11}}>
+  {fl.map(e=>{const k=c+'/'+e.file;const L=lrn[k]||{};const pick=L.csv??(e.csvs?.[0]||'__path');
+  return<div key={e.file} style={{padding:'2px 0'}}>
+    <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+      <input type="checkbox" checked={!!e.src} onChange={ev=>setFileSrc(c,e,ev.target.checked?guessSrc(e):null)} title="병합에 사용"/>
+      <select value={e.src||''} onChange={ev=>setFileSrc(c,e,ev.target.value||null)} style={{fontSize:10,padding:'1px 4px'}}>
+        <option value="">사용 안 함</option><option value="br">BR</option><option value="ams">AMS</option><option value="mx100">MX100</option><option value="nidaq">NIDAQ</option>
+      </select>
+      <span style={{fontFamily:'var(--mono)',color:e.src?'var(--tx)':'var(--tx3)'}}>{e.file}</span>
+      <span style={{color:'var(--tx3)'}}>{fmtB(e.size)}</span>
+      {e.auto&&e.src&&e.auto!==e.src&&<span style={{color:'var(--tx3)'}}>(자동 판별: {e.auto.toUpperCase()})</span>}
+      {e.why&&!e.src&&<span style={{color:'#b45309'}}>{e.why}</span>}
+    </div>
+    {e.learn&&<div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',margin:'3px 0 4px 22px'}}>
+      <span style={{color:'var(--tx2)'}}>AMS .dat 형식 학습 — 같은 측정을 AMS 에서 내보낸 CSV:</span>
+      <select value={pick} onChange={ev=>setLrn(p=>({...p,[k]:{...L,csv:ev.target.value}}))} style={{fontSize:10,padding:'1px 4px',maxWidth:260}}>
+        {(e.csvs||[]).map(x=><option key={x} value={x}>{x}</option>)}<option value="__path">다른 폴더의 CSV (경로 입력)…</option>
+      </select>
+      {pick==='__path'&&<input className="pi" style={{fontSize:10,padding:'2px 6px',width:280}} placeholder="D:\실험\같은측정.csv" value={L.path||''} onChange={ev=>setLrn(p=>({...p,[k]:{...L,path:ev.target.value}}))}/>}
+      <button className="bt bp" style={{fontSize:10,padding:'2px 10px'}} disabled={L.busy} onClick={()=>learnDat(c,e)}>{L.busy?'학습 중…':'형식 학습'}</button>
+    </div>}
+    {L.res&&<div style={{margin:'2px 0 6px 22px',padding:'4px 8px',borderRadius:4,background:L.res.ok?'rgba(34,197,94,.08)':'rgba(239,68,68,.08)',color:'var(--tx2)'}}>
+      {L.res.ok?<b style={{color:'#16a34a'}}>✅ 형식 학습 성공 — 이제 이 형식의 .dat 는 AMS 로 읽힙니다</b>:<b style={{color:'#dc2626'}}>❌ 형식 학습 실패 — {L.res.why}</b>}
+      {L.res.value_pct!=null&&<div>검증: 값 {L.res.value_pct}% · 시각 {L.res.time_pct}% 일치 ({(L.res.rows||0).toLocaleString()}행) · 찾은 열 {L.res.columns}개 + 상태 열 {L.res.codes}개{L.res.unmapped?.length>0&&` · 위치 못 찾은 열 ${L.res.unmapped.length}개 (${L.res.unmapped.slice(0,6).join(', ')}${L.res.unmapped.length>6?' …':''})`}</div>}
+      {(L.res.notes||[]).map((n,i)=><div key={i} style={{color:'var(--tx3)'}}>· {n}</div>)}
+      {!L.res.ok&&L.res.look&&<div style={{color:'var(--tx3)'}}>파일: {fmtB(L.res.look.size)}{L.res.look.sig?` · 형식 서명 ${L.res.look.sig}`:''} · 엔트로피 {L.res.look.entropy}{L.res.look.record?` · 반복 기록 ${L.res.look.record}바이트 × ${L.res.look.records}개`:' · 반복 기록 없음'}</div>}
+    </div>}
+  </div>})}
+  {Object.keys(ovr[c]||{}).length>0&&<div style={{marginTop:4,color:'var(--tx3)'}}>※ 고른 파일은 Merge 와 변수 스캔에 그대로 쓰입니다. 변수 목록이 이미 있으면 '변수 스캔'을 다시 누르세요.</div>}
+</div>}
+</div>})}
 {Object.keys(unm).length>0&&(()=>{const L=Object.entries(unm).flatMap(([c,l])=>l.map(u=>({c,...u})));return<div style={{marginTop:6,padding:'6px 10px',borderRadius:6,background:'rgba(234,179,8,.08)',border:'1px solid rgba(234,179,8,.3)',fontSize:11,color:'var(--tx2)'}}>
-  <div style={{fontWeight:600,color:'#b45309',marginBottom:2}}>⚠️ 병합에 쓰이지 않는 데이터 파일 {L.length}개</div>
-  {L.slice(0,8).map((u,i)=><div key={i}>{u.c} / <b>{u.file}</b> — {u.why}</div>)}{L.length>8&&<div>… 외 {L.length-8}개</div>}
+  <div style={{fontWeight:600,color:'#b45309',marginBottom:2}}>⚠️ 병합에 쓰이지 않는 데이터 파일 {L.length}개 <span style={{fontWeight:400,color:'var(--tx3)'}}>— 줄을 누르면 그 케이스의 파일 선택이 열립니다</span></div>
+  {L.slice(0,8).map((u,i)=><div key={i} style={{cursor:'pointer'}} onClick={()=>setOpenC(p=>new Set(p).add(u.c))}>{u.c} / <b>{u.file}</b> — {u.why}</div>)}{L.length>8&&<div>… 외 {L.length-8}개</div>}
 </div>})()}</div>}
 </>}
 </div>)}
@@ -2918,7 +2984,7 @@ return(<div><div className="fg"><div>
 </div>
 
 <div className="cd"><div className="ct">파일 식별 규칙</div>
-<div style={{fontSize:11,color:'var(--tx3)',marginBottom:8}}>각 소스별로 파일을 구별하는 규칙을 설정합니다. 우선순위: MX100 → NIDAQ → AMS → BR (마지막 폴백)<br/>규칙에 안 맞는 <b>.dat</b> 는 내용을 보고 판별합니다 — AMS 형식이면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 병합. .csv/.tsv 가 아닌 확장자(.dat, .txt 등)는 구분자·헤더 줄·단위 줄·인코딩을 자동으로 판별해 읽습니다 (.txt 등은 위 확장자 칸에 넣어야 사용)<br/><b>AMS 프로그램 바이너리 .dat</b> 는 diagnose.bat 에 .dat 와 같은 측정의 CSV(같은 이름)를 함께 끌어놓아 형식을 한 번 학습시키면 AMS 로 읽습니다</div>
+<div style={{fontSize:11,color:'var(--tx3)',marginBottom:8}}>각 소스별로 파일을 구별하는 규칙을 설정합니다. 우선순위: MX100 → NIDAQ → AMS → BR (마지막 폴백)<br/>규칙에 안 맞는 <b>.dat</b> 는 내용을 보고 판별합니다 — AMS 형식이면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 병합. .csv/.tsv 가 아닌 확장자(.dat, .txt 등)는 구분자·헤더 줄·단위 줄·인코딩을 자동으로 판별해 읽습니다 (.txt 등은 위 확장자 칸에 넣어야 사용)<br/><b>AMS 프로그램 바이너리 .dat</b> 는 Merge 탭에서 케이스 확정 후 '파일 선택' → 같은 측정의 CSV 를 골라 [형식 학습] 을 한 번 하면 AMS 로 읽습니다 (diagnose.bat 으로도 가능)</div>
 {['mx100','nidaq','ams','br'].map(src=>{
   const rule=l?.file_rules?.[src]||{};
   const setRule=(k,v)=>{const fr=JSON.parse(JSON.stringify(l?.file_rules||{}));if(!fr[src])fr[src]={};fr[src][k]=v;s('file_rules',fr)};

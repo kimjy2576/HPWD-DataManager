@@ -25,12 +25,14 @@ def find_files(data_path: str) -> dict:
 # ──────────────────────────────────────────────
 #  파일명 자동 변환  (_br / _temp 접미사 부여)
 # ──────────────────────────────────────────────
-def rename_files_in_folder(folder_path: str) -> None:
+def rename_files_in_folder(folder_path: str) -> dict:
     """
     폴더 내 .csv → _br.csv, .xls → _temp.xls 로 이름 변경.
     - 이미 BR/_br 또는 MX100/_temp 파일이 존재하면 변환하지 않음
     - _merged, _calc, _formula, _result 파일은 절대 변환하지 않음
+    반환: {원래 이름: 새 이름} (케이스 파일 선택을 바뀐 이름에 맞추는 데 사용)
     """
+    renamed = {}
     files = os.listdir(folder_path)
     files_lower = [f.lower() for f in files]
 
@@ -58,6 +60,8 @@ def rename_files_in_folder(folder_path: str) -> None:
 
         if new_name:
             os.replace(filepath, os.path.join(folder_path, new_name))
+            renamed[filename] = new_name
+    return renamed
 
 
 # ──────────────────────────────────────────────

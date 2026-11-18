@@ -1200,8 +1200,8 @@ def read_dat(path, nrows: int | None = None, log=print) -> pd.DataFrame:
     sp, start = find_spec(path, head=buf)
     name = Path(path).name
     if sp is None:
-        log(f"  [ams_dat] {name}: ⚠️ 학습된 AMS .dat 형식과 맞지 않음 — diagnose.bat 에 이 .dat 와 "
-            f"AMS 프로그램에서 내보낸 같은 측정의 CSV 를 함께 끌어놓아 형식을 학습시키세요")
+        log(f"  [ams_dat] {name}: ⚠️ 학습된 AMS .dat 형식과 맞지 않음 — 케이스 확정 후 '파일 선택'에서 "
+            f"같은 측정을 AMS 에서 내보낸 CSV 를 골라 [형식 학습] (또는 diagnose.bat)")
         return pd.DataFrame()
     df = decode(buf, sp, start, nrows)
     miss = [c for c in sp["csv_columns"] if c not in df.columns]
