@@ -1179,11 +1179,14 @@ function VwRenameDialog({dlg,root,busy,onCancel,onOk}){
   const t=v.trim();
   const srcDirs=[...new Set((dlg.files||[]).map(f=>f.source_dir).filter(Boolean))];
   const sep='\\';
+  const isNew=dlg.kind==='newfolder';   // 새 (하위) 폴더 — '/' 로 여러 단계를 한 번에
+  const newParts=isNew?t.split(/[\\/]/).map(x=>x.trim()).filter(Boolean):[];
   const after=dlg.kind==='folder'
     ?[(root?root+sep:'')+[...dlg.folder.split('/').slice(0,-1),t].join(sep)]
+    :isNew?[(root?root+sep:'')+[...(dlg.parent?dlg.parent.split('/'):[]),...newParts].join(sep)]
     :(dlg.files||[]).map(f=>t+(dlg.kind==='case'?f.name.slice(dlg.base.length):dlg.suffix));
-  const bad=/[<>:"/\\|?*]/.test(t);
-  const ok=t&&t!==dlg.value&&!bad;
+  const bad=isNew?/[<>:"|?*]/.test(t):/[<>:"/\\|?*]/.test(t);
+  const ok=t&&t!==dlg.value&&!bad&&(!isNew||newParts.length>0);
   const submit=()=>{if(ok&&!busy)onOk(t,alsoSrc)};
   return(<div onMouseDown={onCancel} style={{position:'fixed',inset:0,background:'rgba(0,0,0,.35)',zIndex:2000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}>
     <div onMouseDown={e=>e.stopPropagation()} style={{background:'var(--bg)',border:'1px solid var(--bd2)',borderRadius:10,padding:18,width:'min(600px,100%)',boxShadow:'0 12px 36px rgba(0,0,0,.25)'}}>
@@ -1192,10 +1195,11 @@ function VwRenameDialog({dlg,root,busy,onCancel,onOk}){
         <input ref={inp} type="text" value={v} onChange={e=>setV(e.target.value)} onKeyDown={e=>{if(e.key==='Enter')submit();if(e.key==='Escape')onCancel()}} style={{flex:1,fontFamily:'var(--mono)',fontSize:12,padding:'6px 8px'}}/>
         {dlg.kind==='file'&&<span style={{fontFamily:'var(--mono)',fontSize:12,color:'var(--tx3)',whiteSpace:'nowrap'}}>{dlg.suffix}</span>}
       </div>
-      {bad&&<div style={{fontSize:11,color:'var(--red)',marginTop:6}}>{'\\ / : * ? " < > |'} 는 이름에 쓸 수 없습니다</div>}
-      <div className="it" style={{marginTop:10}}>{dlg.kind==='folder'?'바뀐 뒤 실제 위치':'바뀐 뒤 파일 이름'}</div>
+      {bad&&<div style={{fontSize:11,color:'var(--red)',marginTop:6}}>{isNew?': * ? " < > |':'\\ / : * ? " < > |'} 는 이름에 쓸 수 없습니다</div>}
+      <div className="it" style={{marginTop:10}}>{isNew?'만들어질 실제 위치':dlg.kind==='folder'?'바뀐 뒤 실제 위치':'바뀐 뒤 파일 이름'}</div>
       <div style={{fontFamily:'var(--mono)',fontSize:11,color:'var(--tx2)',maxHeight:130,overflowY:'auto',background:'var(--bg2)',padding:'6px 8px',borderRadius:6,marginTop:4,wordBreak:'break-all'}}>{after.map(a=><div key={a}>{a}</div>)}</div>
-      {dlg.kind!=='folder'&&(srcDirs.length>0
+      {isNew&&<div className="it" style={{marginTop:8}}>results 안에 실제 폴더로 만들어집니다. '/' 를 넣으면 여러 단계를 한 번에 만듭니다 (예: 2026-11/건조A).</div>}
+      {dlg.kind!=='folder'&&!isNew&&(srcDirs.length>0
         ?<label style={{display:'flex',gap:6,alignItems:'flex-start',marginTop:12,fontSize:12,cursor:'pointer'}}>
           <input type="checkbox" checked={alsoSrc} onChange={e=>setAlsoSrc(e.target.checked)} style={{accentColor:'var(--teal)',marginTop:2}}/>
           <span>원본 케이스 폴더에 있는 사본도 같이 이름 변경
@@ -1206,7 +1210,7 @@ function VwRenameDialog({dlg,root,busy,onCancel,onOk}){
       {dlg.kind==='folder'&&<div className="it" style={{marginTop:8}}>results 안의 폴더 이름만 바뀝니다. 원본 데이터 폴더는 그대로입니다.</div>}
       <div style={{display:'flex',justifyContent:'flex-end',gap:8,marginTop:14}}>
         <button className="bt bs" onClick={onCancel}>취소</button>
-        <button className="bt bg" onClick={submit} disabled={!ok||busy}>{busy?'바꾸는 중…':'이름 변경'}</button>
+        <button className="bt bg" onClick={submit} disabled={!ok||busy}>{isNew?(busy?'만드는 중…':'만들기'):(busy?'바꾸는 중…':'이름 변경')}</button>
       </div>
     </div>
   </div>);
@@ -1266,6 +1270,22 @@ const fsCall=async(url,body)=>{setFsBusy(true);
   catch(e){alert('❌ '+e.message);return null}
   finally{setFsBusy(false);reloadFiles()}};
 useEffect(()=>{reloadFiles()},[]);
+// 폴더 트리: '' = results 바로 아래, 'A/B' = A 안의 B
+const vwParent=p=>p.includes('/')?p.slice(0,p.lastIndexOf('/')):'';
+// p 와 그 상위 폴더들을 펼침 (옮긴 곳·새 폴더가 보이도록)
+const expandTo=p=>setExpandedGroups(s=>{const n={...s};for(let q=p||'';;q=vwParent(q)){n['__folder__'+q]=true;if(!q)break}return n});
+// 폴더 이름 변경·이동 뒤 펼침 상태를 새 경로로 옮김 (하위 폴더·케이스 포함)
+const remapExp=(o,nw)=>setExpandedGroups(s=>{const n={},mv=f=>(f===o||f.startsWith(o+'/'))?nw+f.slice(o.length):f;
+  for(const[k,v]of Object.entries(s)){
+    if(k.startsWith('__folder__'))n['__folder__'+mv(k.slice(10))]=v;
+    else{const i=k.indexOf('\u0000');n[i<0?k:mv(k.slice(0,i))+k.slice(i)]=v}}
+  return n});
+// 끌어다 놓기: dnd = {kind:'case',key,names,from} | {kind:'folder',path,from}, dropAt = 놓을 폴더
+// (판정은 바로 바뀌는 ref 로, 화면 표시는 state 로)
+const[dnd,setDnd]=useState(null);
+const dndRef=useRef(null);
+const hoverRef=useRef({});
+const[dropAt,setDropAt]=useState(null);
 
 // autoLoad: Calc 완료 후 자동 로드
 const[pendingLoad,setPendingLoad]=useState(false);
@@ -1477,102 +1497,172 @@ return(<div>
         if(!groups[k])groups[k]={key:k,base:b,folder:fd,files:[]};
         groups[k].files.push(f);
       });
-      // 폴더 = results 안의 실제 하위 폴더, '' = results 바로 아래
+      // 폴더 트리 = results 안의 실제 폴더 구조 ('' = results 바로 아래, 'A/B' = A 안의 B)
       const ROOT='';
-      const folderBuckets={};
-      folders.forEach(fn=>{folderBuckets[fn]=[]});
-      folderBuckets[ROOT]=[];
-      Object.values(groups).forEach(g=>{(folderBuckets[g.folder]=folderBuckets[g.folder]||[]).push(g)});
-      Object.values(folderBuckets).forEach(arr=>arr.sort((a,b)=>a.base.localeCompare(b.base)));
-      const allFolders=Object.keys(folderBuckets).filter(f=>f!==ROOT).sort((a,b)=>a.localeCompare(b));
+      const leafOf=p=>p.slice(p.lastIndexOf('/')+1);
+      const kids={[ROOT]:[]},bucket={[ROOT]:[]};
+      const addPath=p=>{if(!p||kids[p])return;kids[p]=[];bucket[p]=[];addPath(vwParent(p));kids[vwParent(p)].push(p)};
+      folders.forEach(addPath);
+      Object.values(groups).forEach(g=>{addPath(g.folder);bucket[g.folder].push(g)});
+      const nat=(a,b)=>a.localeCompare(b,undefined,{numeric:true,sensitivity:'base'});
+      Object.values(kids).forEach(a=>a.sort((x,y)=>nat(leafOf(x),leafOf(y))));
+      Object.values(bucket).forEach(a=>a.sort((x,y)=>nat(x.base,y.base)));
+      // 위→아래 트리 순서의 폴더 목록 + 폴더별 (하위 폴더 포함) 파일·케이스
+      const treeOrder=[];
+      const walk=p=>kids[p].forEach(c=>{treeOrder.push(c);walk(c)});
+      walk(ROOT);
+      const deepFiles={},deepCases={};
+      const tally=p=>{let fs=bucket[p].flatMap(g=>g.files),n=bucket[p].length;
+        kids[p].forEach(c=>{tally(c);fs=fs.concat(deepFiles[c]);n+=deepCases[c]});
+        deepFiles[p]=fs;deepCases[p]=n};
+      kids[ROOT].forEach(tally);
       const allGroups=Object.values(groups);
 
-      const expandAll=()=>{const n={};[...allFolders,ROOT].forEach(f=>n['__folder__'+f]=true);allGroups.forEach(g=>n[g.key]=true);setExpandedGroups(n)};
-      const collapseAll=()=>{const n={};[...allFolders,ROOT].forEach(f=>n['__folder__'+f]=false);allGroups.forEach(g=>n[g.key]=false);setExpandedGroups(n)};
-      const addFolder=async()=>{const name=prompt('새 폴더 이름 (results 폴더 안에 실제 폴더로 만들어집니다):');if(!name||!name.trim())return;await fsCall('/api/result-folders',{name:name.trim()})};
-      const removeFolder=async(fn,n)=>{if(!confirm(`"${fn}" 폴더를 삭제할까요?\n\n안의 파일 ${n}개는 지우지 않고 results 바로 아래로 옮깁니다.`))return;
+      const setAllExp=v=>{const n={};[...treeOrder,ROOT].forEach(f=>n['__folder__'+f]=v);allGroups.forEach(g=>n[g.key]=v);setExpandedGroups(n)};
+      const newFolder=parent=>setRenameDlg({kind:'newfolder',title:parent?`"${parent}" 안에 하위 폴더 만들기`:'새 폴더 만들기 (results 바로 아래)',value:'',parent});
+      const removeFolder=async(fn)=>{
+        const par=vwParent(fn),nSub=kids[fn].length,nCase=bucket[fn].length;
+        const what=[nCase&&`케이스 ${nCase}개`,nSub&&`하위 폴더 ${nSub}개`].filter(Boolean).join('와 ');
+        if(!confirm(`"${fn}" 폴더를 삭제할까요?\n\n`+(what
+          ?`안의 ${what}는 지우지 않고 ${par?`상위 폴더 "${par}"`:'results 바로 아래'}로 한 단계 올립니다.`+(nSub?'\n(하위 폴더는 안의 내용 그대로 올라갑니다)':'')
+          :'빈 폴더입니다.')))return;
         const d=await fsCall('/api/result-folders/delete',{name:fn});
         if(d&&!d.removed&&d.left?.length)alert(`결과 파일은 옮겼지만, 폴더 안에 다른 파일이 있어 폴더는 남겨 두었습니다:\n${d.left.join('\n')}`)};
-      const moveToFolder=async(names,fn)=>{if(names.length)await fsCall('/api/result-files/move',{names,folder:fn})};
+      const moveToFolder=async(names,fn)=>{if(!names.length)return;
+        const d=await fsCall('/api/result-files/move',{names,folder:fn});
+        if(!d)return;expandTo(fn);
+        if(d.errors?.length)alert('옮기지 못한 파일:\n'+d.errors.join('\n'))};
+      const moveFolder=async(fn,to)=>{const d=await fsCall('/api/result-folders/move',{name:fn,parent:to});
+        if(d&&d.moved){remapExp(fn,d.folder);expandTo(to)}};
 
-      const renderBase=(g)=>{
+      // 끌어다 놓기 — 케이스·폴더 줄을 폴더 줄 (또는 '(폴더 없음)') 위에 놓으면 그 안으로 이동
+      const canDrop=to=>{const d=dndRef.current;
+        return !!d&&!fsBusy&&to!==d.from&&(d.kind==='case'||(to!==d.path&&!to.startsWith(d.path+'/')))};
+      const dragProps=item=>({draggable:!fsBusy,
+        onDragStart:e=>{e.stopPropagation();e.dataTransfer.effectAllowed='move';try{e.dataTransfer.setData('text/plain',item.label||'')}catch{}
+          dndRef.current=item;
+          setTimeout(()=>setDnd(item),0)},   // 드래그 시작 순간 화면을 바꾸면 브라우저가 드래그를 취소할 수 있어 한 박자 늦춤
+        onDragEnd:()=>{dndRef.current=null;hoverRef.current={};setDnd(null);setDropAt(null)}});
+      const dropProps=to=>({
+        onDragOver:e=>{if(!canDrop(to))return;e.preventDefault();e.dataTransfer.dropEffect='move';if(dropAt!==to)setDropAt(to);
+          // 접힌 폴더 위에 잠시 머물면 펼침 (그 안의 하위 폴더에 놓을 수 있게)
+          const h=hoverRef.current;
+          if(h.path!==to)hoverRef.current={path:to,since:Date.now()};
+          else if(to&&Date.now()-h.since>700&&expandedGroups['__folder__'+to]===false)setExpandedGroups(p=>({...p,['__folder__'+to]:true}))},
+        onDrop:e=>{e.preventDefault();e.stopPropagation();const d=dndRef.current,ok=canDrop(to);dndRef.current=null;setDnd(null);setDropAt(null);
+          if(!d||!ok)return;
+          if(d.kind==='case')moveToFolder(d.names,to);else moveFolder(d.path,to)}});
+      // 목록 안에서 놓을 수 없는 곳 위로 가면 강조를 지움 (줄의 dragover 가 먼저 처리)
+      const listDnd={
+        onDragOver:e=>{if(dndRef.current&&!e.isDefaultPrevented()&&dropAt!==null){setDropAt(null);hoverRef.current={}}},
+        onDragLeave:e=>{if(e.relatedTarget&&!e.currentTarget.contains(e.relatedTarget))setDropAt(null)}};
+      const dropHi=to=>dropAt===to?{background:'rgba(13,148,136,.14)',boxShadow:'inset 0 0 0 2px var(--teal)'}:{};
+
+      // 들여쓰기 + 세로 안내선 (각 상위 단계의 ▼ 아래에 선)
+      const STEP=18;
+      const guides=n=>Array.from({length:n},(_,i)=><span key={'g'+i} style={{position:'absolute',left:16+i*STEP,top:0,bottom:0,width:1,background:'var(--bd2)',pointerEvents:'none'}}/>);
+      const icoBtn={fontSize:9,padding:'1px 5px',border:'1px solid var(--bd2)',background:'var(--bg)',color:'var(--tx3)',borderRadius:3,cursor:'pointer'};
+      const delBtn={fontSize:9,padding:'1px 5px',border:'1px solid rgba(239,68,68,.3)',background:'rgba(239,68,68,.05)',color:'var(--red)',borderRadius:3,cursor:'pointer'};
+      const winPath=p=>resRoot?resRoot+(p?'\\'+p.replace(/\//g,'\\'):''):'';
+
+      const renderBase=(g,depth)=>{
         const b=g.base;
         const isExp=expandedGroups[g.key]!==false;
         const allSel=g.files.every(f=>selFiles.has(f.name));
         const someSel=g.files.some(f=>selFiles.has(f.name));
         const toggleGroup=()=>{setSelFiles(p=>{const s=new Set(p);if(allSel)g.files.forEach(f=>s.delete(f.name));else g.files.forEach(f=>s.add(f.name));return s});setFilterMode('')};
         const toggleExp=()=>setExpandedGroups(p=>({...p,[g.key]:!isExp}));
-        const icoBtn={fontSize:9,padding:'1px 5px',border:'1px solid var(--bd2)',background:'var(--bg)',color:'var(--tx3)',borderRadius:3,cursor:'pointer'};
+        const dragging=dnd?.kind==='case'&&dnd.key===g.key;
         return(<div key={g.key} style={{borderBottom:'1px solid var(--bd)'}}>
-          <div style={{display:'flex',alignItems:'center',gap:6,padding:'4px 8px 4px 20px',background:'var(--bg)',cursor:'pointer'}}>
+          <div {...dragProps({kind:'case',key:g.key,names:g.files.map(f=>f.name),from:g.folder,label:b})} title="끌어다 다른 폴더에 놓으면 옮겨집니다"
+            style={{position:'relative',display:'flex',alignItems:'center',gap:6,padding:`4px 8px 4px ${8+depth*STEP}px`,background:'var(--bg)',cursor:'pointer',opacity:dragging?.45:1}}>
+            {guides(depth)}
             <button onClick={toggleExp} style={{fontSize:10,padding:'0 4px',border:0,background:0,color:'var(--tx2)',cursor:'pointer',width:16}}>{isExp?'▼':'▶'}</button>
             <input type="checkbox" checked={allSel} ref={el=>{if(el)el.indeterminate=someSel&&!allSel}} onChange={toggleGroup} onClick={e=>e.stopPropagation()} style={{accentColor:'var(--teal)'}}/>
             <span onClick={toggleExp} style={{flex:1,fontSize:12,fontWeight:500,color:'var(--tx)',fontFamily:'var(--mono)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={b}>📄 {b}</span>
             <button disabled={fsBusy} onClick={e=>{e.stopPropagation();setRenameDlg({kind:'case',title:'케이스 이름 변경',value:b,base:b,files:g.files})}} style={icoBtn} title="케이스 이름 변경 (merged·calc 파일을 함께)">✏️</button>
-            <select value={g.folder} disabled={fsBusy} onChange={e=>moveToFolder(g.files.map(f=>f.name),e.target.value)} onClick={e=>e.stopPropagation()} style={{fontSize:9,padding:'1px 3px',background:'var(--bg2)',border:'1px solid var(--bd2)',borderRadius:3,color:'var(--tx3)',maxWidth:110}} title="다른 폴더로 이동 (실제 파일이 옮겨짐)">
+            <select value={g.folder} disabled={fsBusy} onChange={e=>moveToFolder(g.files.map(f=>f.name),e.target.value)} onClick={e=>e.stopPropagation()} style={{fontSize:9,padding:'1px 3px',background:'var(--bg2)',border:'1px solid var(--bd2)',borderRadius:3,color:'var(--tx3)',maxWidth:130}} title={'다른 폴더로 이동 (실제 파일이 옮겨짐)\n지금: '+(g.folder||'(폴더 없음)')}>
               <option value="">(폴더 없음)</option>
-              {allFolders.map(fn=><option key={fn} value={fn}>📁 {fn}</option>)}
+              {treeOrder.map(fn=><option key={fn} value={fn}>📁 {fn.split('/').join(' / ')}</option>)}
             </select>
             <span style={{fontSize:9,color:'var(--tx3)',minWidth:24,textAlign:'right'}}>{g.files.filter(f=>selFiles.has(f.name)).length}/{g.files.length}</span>
           </div>
-          {isExp&&g.files.map((f)=>(<div key={f.name} className="file-sel-item" style={{display:'flex',alignItems:'center',gap:6,padding:'3px 8px 3px 48px',borderTop:'1px solid var(--bd)'}}>
+          {isExp&&g.files.map((f)=>(<div key={f.name} className="file-sel-item" style={{position:'relative',display:'flex',alignItems:'center',gap:6,padding:`3px 8px 3px ${8+(depth+1)*STEP+10}px`,borderTop:'1px solid var(--bd)'}}>
+            {guides(depth+1)}
             <input type="checkbox" checked={selFiles.has(f.name)} onChange={()=>{setSelFiles(p=>{const s=new Set(p);s.has(f.name)?s.delete(f.name):s.add(f.name);return s});setFilterMode('')}} style={{accentColor:'var(--teal)'}}/>
-            <span style={{flex:1,fontFamily:'var(--mono)',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={(resRoot?resRoot+'\\'+(f.folder?f.folder.replace(/\//g,'\\')+'\\':''):'')+f.name}>{f.name}</span>
+            <span style={{flex:1,fontFamily:'var(--mono)',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={(resRoot?winPath(f.folder||'')+'\\':'')+f.name}>{f.name}</span>
             {f.dup&&<span title="같은 이름의 파일이 다른 폴더에도 있습니다 — 탐색기에서 하나만 남겨 주세요 (최근 파일이 사용됨)" style={{fontSize:10,cursor:'help'}}>⚠️</span>}
             {f.name.includes('_formula')&&<span style={{fontSize:9,padding:'1px 5px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>formula</span>}
             {f.name.includes('_calc')&&!f.name.includes('_formula')&&<span className="rt rt-c">calc</span>}
             {f.name.includes('_merged')&&<span className="rt rt-m">merged</span>}
             <span className="it">{(f.size/1024).toFixed(0)}KB</span>
             <button disabled={fsBusy} onClick={()=>{const suf=f.name.slice(vwBase(f.name).length);setRenameDlg({kind:'file',title:'파일 이름 변경',value:vwBase(f.name),suffix:suf,files:[f]})}} style={icoBtn} title="이 파일만 이름 변경">✏️</button>
-            <button onClick={async()=>{if(!confirm(`${f.name} 삭제?\n(results 의 파일만 지워지고 원본 케이스 폴더의 사본은 남습니다)`))return;const r=await fetch(`${API}/api/results/${encodeURIComponent(f.name)}`,{method:'DELETE'});if(!r.ok){const d=await r.json().catch(()=>({}));alert('❌ '+(d.detail||r.status))}setSelFiles(p=>{const s=new Set(p);s.delete(f.name);return s});reloadFiles()}} style={{fontSize:9,padding:'1px 5px',border:'1px solid rgba(239,68,68,.3)',background:'rgba(239,68,68,.05)',color:'var(--red)',borderRadius:3,cursor:'pointer'}}>×</button>
+            <button onClick={async()=>{if(!confirm(`${f.name} 삭제?\n(results 의 파일만 지워지고 원본 케이스 폴더의 사본은 남습니다)`))return;const r=await fetch(`${API}/api/results/${encodeURIComponent(f.name)}`,{method:'DELETE'});if(!r.ok){const d=await r.json().catch(()=>({}));alert('❌ '+(d.detail||r.status))}setSelFiles(p=>{const s=new Set(p);s.delete(f.name);return s});reloadFiles()}} style={delBtn}>×</button>
           </div>))}
         </div>);
       };
 
-      const folderOrder=[...allFolders,ROOT];
+      // 폴더 줄 (fn='' 이면 results 바로 아래 = '(폴더 없음)')
+      const renderFolder=(fn,depth)=>{
+        const isRoot=fn===ROOT;
+        const gs=bucket[fn],ch=isRoot?[]:kids[fn];
+        const fExp=expandedGroups['__folder__'+fn]!==false;
+        const fToggle=()=>setExpandedGroups(p=>({...p,['__folder__'+fn]:!fExp}));
+        const fFiles=isRoot?gs.flatMap(g=>g.files):deepFiles[fn];
+        const fAllSel=fFiles.length>0&&fFiles.every(f=>selFiles.has(f.name));
+        const fSomeSel=fFiles.some(f=>selFiles.has(f.name));
+        const fToggleSel=()=>{setSelFiles(p=>{const s=new Set(p);if(fAllSel)fFiles.forEach(f=>s.delete(f.name));else fFiles.forEach(f=>s.add(f.name));return s});setFilterMode('')};
+        const nCase=isRoot?gs.length:deepCases[fn];
+        const dragging=dnd?.kind==='folder'&&dnd.path===fn;
+        return(<div key={'__folder__'+fn}>
+          <div {...(isRoot?{}:dragProps({kind:'folder',path:fn,from:vwParent(fn),label:leafOf(fn)}))} {...dropProps(fn)}
+            style={{position:'relative',display:'flex',alignItems:'center',gap:6,padding:`5px 8px 5px ${8+depth*STEP}px`,background:isRoot?'var(--bg2)':'var(--bg3)',borderBottom:'1px solid var(--bd)',cursor:'pointer',fontWeight:600,opacity:dragging?.45:1,...dropHi(fn)}}>
+            {guides(depth)}
+            <button onClick={fToggle} style={{fontSize:10,padding:'0 4px',border:0,background:0,color:'var(--tx2)',cursor:'pointer',width:16}}>{fExp?'▼':'▶'}</button>
+            <input type="checkbox" checked={fAllSel} ref={el=>{if(el)el.indeterminate=fSomeSel&&!fAllSel}} onChange={fToggleSel} onClick={e=>e.stopPropagation()} style={{accentColor:'var(--teal)'}} title={isRoot?'':'이 폴더와 하위 폴더의 파일 모두 선택'}/>
+            <span onClick={fToggle} style={{flex:1,fontSize:12,color:isRoot?'var(--tx3)':'var(--teal)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={winPath(fn)}>{isRoot?'📂 (폴더 없음)':'📁 '+leafOf(fn)} <span style={{fontSize:9,color:'var(--tx3)',fontWeight:400}} title={isRoot?'':'케이스 수 (하위 폴더 포함)'}>({nCase})</span></span>
+            {!isRoot&&<>
+              <button disabled={fsBusy} onClick={e=>{e.stopPropagation();newFolder(fn)}} style={{...icoBtn,color:'var(--teal)'}} title="이 폴더 안에 하위 폴더 만들기">+📁</button>
+              <button disabled={fsBusy} onClick={e=>{e.stopPropagation();setRenameDlg({kind:'folder',title:'폴더 이름 변경',value:leafOf(fn),folder:fn})}} style={icoBtn} title="폴더 이름 변경 (실제 폴더)">✏️</button>
+              <button disabled={fsBusy} onClick={e=>{e.stopPropagation();removeFolder(fn)}} style={delBtn} title="폴더 삭제 (안의 파일·하위 폴더는 한 단계 위로)">×</button>
+            </>}
+          </div>
+          {fExp&&ch.map(c=>renderFolder(c,depth+1))}
+          {fExp&&gs.map(g=>renderBase(g,depth+1))}
+          {(fExp||isRoot)&&!gs.length&&!ch.length&&<div className="it" style={{position:'relative',padding:`4px 8px 4px ${8+(depth+1)*STEP+10}px`,borderBottom:'1px solid var(--bd)'}}>{guides(depth+1)}
+            {isRoot?'여기에 놓으면 results 바로 아래로 옮겨집니다':'비어 있음 — 케이스나 폴더를 끌어다 놓거나 케이스 줄의 폴더 선택으로 옮기세요'}</div>}
+        </div>);
+      };
+      const showRoot=bucket[ROOT].length>0||canDrop(ROOT);   // 폴더 밖 파일이 없으면 숨김 (끌고 있을 땐 놓을 자리로 보임)
+
       return(<>
         {/* 툴바 */}
         <div style={{display:'flex',gap:4,alignItems:'center',padding:'4px 8px',background:'var(--bg3)',border:'1px solid var(--bd)',borderTop:'1px solid var(--bd)',borderRadius:'8px 8px 0 0',fontSize:10}}>
-          <button className="bt bs" onClick={expandAll} style={{fontSize:9,padding:'2px 8px'}}>⊞ 모두 펼치기</button>
-          <button className="bt bs" onClick={collapseAll} style={{fontSize:9,padding:'2px 8px'}}>⊟ 모두 접기</button>
+          <button className="bt bs" onClick={()=>setAllExp(true)} style={{fontSize:9,padding:'2px 8px'}}>⊞ 모두 펼치기</button>
+          <button className="bt bs" onClick={()=>setAllExp(false)} style={{fontSize:9,padding:'2px 8px'}}>⊟ 모두 접기</button>
           <span style={{width:1,height:12,background:'var(--bd2)',margin:'0 4px'}}/>
-          <button className="bt bs" disabled={fsBusy} onClick={addFolder} style={{fontSize:9,padding:'2px 8px',color:'var(--teal)',borderColor:'var(--teal)'}}>+ 폴더</button>
+          <button className="bt bs" disabled={fsBusy} onClick={()=>newFolder(ROOT)} style={{fontSize:9,padding:'2px 8px',color:'var(--teal)',borderColor:'var(--teal)'}} title="results 바로 아래에 새 폴더 (하위 폴더는 폴더 줄의 +📁)">+ 폴더</button>
+          {dnd&&canDrop(ROOT)&&<span {...dropProps(ROOT)} style={{marginLeft:4,padding:'2px 8px',border:'1px dashed var(--teal)',borderRadius:4,color:'var(--teal)',fontSize:9,whiteSpace:'nowrap',...dropHi(ROOT)}}>⤒ 여기에 놓으면 맨 위로 (results 바로 아래)</span>}
           <span style={{flex:1,minWidth:8}}/>
-          <span style={{color:'var(--tx3)',fontSize:9,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'55%'}} title={resRoot}>{allGroups.length}개 케이스 / {allFolders.length}개 폴더{resRoot&&<> · 📂 {resRoot}</>}</span>
+          <span style={{color:'var(--tx3)',fontSize:9,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'55%'}} title={resRoot}>{allGroups.length}개 케이스 / {treeOrder.length}개 폴더{resRoot&&<> · 📂 {resRoot}</>}</span>
         </div>
-        <div className="file-sel" style={{maxHeight:320,overflowY:'auto',borderTop:0,borderRadius:'0 0 8px 8px'}}>
-          {folderOrder.map((fn)=>{
-            const gs=folderBuckets[fn]||[];
-            const isRoot=fn===ROOT;
-            if(isRoot&&gs.length===0)return null; // 폴더 밖 파일이 없으면 숨김
-            const fExp=expandedGroups['__folder__'+fn]!==false;
-            const fToggle=()=>setExpandedGroups(p=>({...p,['__folder__'+fn]:!fExp}));
-            const fFiles=gs.flatMap(g=>g.files);
-            const fAllSel=fFiles.length>0&&fFiles.every(f=>selFiles.has(f.name));
-            const fSomeSel=fFiles.some(f=>selFiles.has(f.name));
-            const fToggleSel=()=>{setSelFiles(p=>{const s=new Set(p);if(fAllSel)fFiles.forEach(f=>s.delete(f.name));else fFiles.forEach(f=>s.add(f.name));return s});setFilterMode('')};
-            return(<div key={'__folder__'+fn} style={{borderBottom:'1px solid var(--bd)'}}>
-              <div style={{display:'flex',alignItems:'center',gap:6,padding:'5px 8px',background:isRoot?'var(--bg2)':'var(--bg3)',cursor:'pointer',fontWeight:600}}>
-                <button onClick={fToggle} style={{fontSize:10,padding:'0 4px',border:0,background:0,color:'var(--tx2)',cursor:'pointer',width:16}}>{fExp?'▼':'▶'}</button>
-                <input type="checkbox" checked={fAllSel} ref={el=>{if(el)el.indeterminate=fSomeSel&&!fAllSel}} onChange={fToggleSel} onClick={e=>e.stopPropagation()} style={{accentColor:'var(--teal)'}}/>
-                <span onClick={fToggle} style={{flex:1,fontSize:12,color:isRoot?'var(--tx3)':'var(--teal)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={resRoot?resRoot+(isRoot?'':'\\'+fn.replace(/\//g,'\\')):''}>{isRoot?'📂 (폴더 없음)':'📁 '+fn} <span style={{fontSize:9,color:'var(--tx3)',fontWeight:400}}>({gs.length})</span></span>
-                {!isRoot&&<>
-                  <button disabled={fsBusy} onClick={e=>{e.stopPropagation();setRenameDlg({kind:'folder',title:'폴더 이름 변경',value:fn.split('/').pop(),folder:fn})}} style={{fontSize:9,padding:'1px 5px',border:'1px solid var(--bd2)',background:'var(--bg)',color:'var(--tx3)',borderRadius:3,cursor:'pointer'}} title="폴더 이름 변경 (실제 폴더)">✏️</button>
-                  <button disabled={fsBusy} onClick={e=>{e.stopPropagation();removeFolder(fn,fFiles.length)}} style={{fontSize:9,padding:'1px 5px',border:'1px solid rgba(239,68,68,.3)',background:'rgba(239,68,68,.05)',color:'var(--red)',borderRadius:3,cursor:'pointer'}} title="폴더 삭제 (파일은 results 바로 아래로 이동)">×</button>
-                </>}
-              </div>
-              {fExp&&gs.map(g=>renderBase(g))}
-              {fExp&&!isRoot&&gs.length===0&&<div className="it" style={{padding:'4px 8px 4px 44px'}}>비어 있음 — 케이스 줄의 폴더 선택으로 옮겨 넣으세요</div>}
-            </div>);
-          })}
+        <div className="file-sel" {...listDnd} style={{maxHeight:320,overflowY:'auto',borderTop:0,borderRadius:'0 0 8px 8px',marginBottom:4}}>
+          {kids[ROOT].map(c=>renderFolder(c,0))}
+          {showRoot&&renderFolder(ROOT,0)}
         </div>
+        {treeOrder.length>0&&<div className="it" style={{marginBottom:8}}>💡 케이스·폴더 줄을 끌어다 다른 폴더 줄에 놓으면 그 안으로 옮겨집니다 (실제 파일·폴더가 이동). 폴더 줄의 +📁 = 하위 폴더 만들기</div>}
       </>);
     })():<div className="it" style={{padding:16,textAlign:'center'}}>결과 파일이 없습니다.</div>}
     {renameDlg&&<VwRenameDialog dlg={renameDlg} root={resRoot} busy={fsBusy} onCancel={()=>setRenameDlg(null)} onOk={async(v,alsoSrc)=>{
       const dlg=renameDlg;
+      if(dlg.kind==='newfolder'){
+        const d=await fsCall('/api/result-folders',{name:v,parent:dlg.parent||''});
+        if(d){expandTo(vwParent(d.folder));setRenameDlg(null)}
+        return;
+      }
       if(dlg.kind==='folder'){
         const d=await fsCall('/api/result-folders/rename',{name:dlg.folder,new_name:v});
-        if(d){setExpandedGroups(p=>({...p,['__folder__'+d.folder]:p['__folder__'+dlg.folder]}));setRenameDlg(null)}
+        if(d){remapExp(dlg.folder,d.folder);setRenameDlg(null)}
         return;
       }
       const renames=dlg.files.map(f=>({old:f.name,new:v+(dlg.kind==='case'?f.name.slice(dlg.base.length):dlg.suffix)}));

@@ -887,11 +887,18 @@ def _res_folder_of(p):
 
 
 def _res_folder_path(folder):
-    """'A' 또는 'A/B' → results 안의 실제 경로. 각 단계 이름을 검사해 results 밖으로 못 나가게 함."""
+    """'A' 또는 'A/B' → results 안의 실제 경로. 각 단계 이름을 검사해 results 밖으로 못 나가게 함
+    ('_'·'.' 으로 시작하는 프로그램용 폴더도 거부)."""
     folder = str(folder or "").strip().replace("\\", "/").strip("/")
     if not folder:
         return RESULT_DIR
-    return RESULT_DIR.joinpath(*[_check_name(x, "폴더 이름") for x in folder.split("/")])
+    return RESULT_DIR.joinpath(*[_check_folder_name(x) for x in folder.split("/") if x.strip()])
+
+
+def _res_rel(p):
+    """results 안의 실제 폴더 경로 → 'A/B' ('' = results 바로 아래)."""
+    rel = Path(p).relative_to(RESULT_DIR).as_posix()
+    return "" if rel == "." else rel
 
 
 def _sources_load():
@@ -2808,6 +2815,7 @@ def list_results():
 class ResFolderReq(BaseModel):
     name: str
     new_name: Optional[str] = None
+    parent: str = ""             # 만들기: 이 폴더 안에 / 옮기기: 이 폴더 안으로 ('' = results 바로 아래)
 
 
 class ResMoveReq(BaseModel):
@@ -2842,11 +2850,22 @@ def _check_folder_name(name):
 
 @app.post("/api/result-folders")
 def create_result_folder(req: ResFolderReq):
-    p = RESULT_DIR / _check_folder_name(req.name)   # 한 단계만 ('/' 불가)
+    """새 폴더 — parent 폴더 안에 만든다 (parent='' → results 바로 아래).
+    이름에 '/' 를 넣으면 여러 단계를 한 번에 만든다 (예: '2026-11/건조A')."""
+    base = _res_folder_path(req.parent)
+    if not base.is_dir():
+        raise HTTPException(404, f"상위 폴더 없음: {req.parent}")
+    parts = [x for x in str(req.name or "").replace("\\", "/").split("/") if x.strip()]
+    if not parts:
+        raise HTTPException(400, "폴더 이름이 비어 있습니다")
+    p = base.joinpath(*[_check_folder_name(x) for x in parts])
     if p.exists():
-        raise HTTPException(409, f"이미 있는 폴더입니다: {req.name}")
-    p.mkdir(parents=True)
-    return {"folder": p.relative_to(RESULT_DIR).as_posix(), "path": str(p)}
+        raise HTTPException(409, f"이미 있는 폴더입니다: {_res_rel(p)}")
+    try:
+        p.mkdir(parents=True)
+    except OSError as e:   # 경로가 너무 김(Windows 260자) · 권한 등
+        raise HTTPException(400, f"폴더를 만들 수 없습니다 ({len(str(p))}자 경로): {e.strerror or e}")
+    return {"folder": _res_rel(p), "path": str(p)}
 
 
 @app.post("/api/result-folders/rename")
@@ -2866,30 +2885,63 @@ def rename_result_folder(req: ResFolderReq):
 
 @app.post("/api/result-folders/delete")
 def delete_result_folder(req: ResFolderReq):
-    """폴더 삭제 — 안의 결과 파일은 지우지 않고 results 바로 아래로 옮긴 뒤 폴더를 없앤다."""
+    """폴더 삭제 — 안의 결과 파일과 하위 폴더는 지우지 않고 한 단계 위(상위 폴더)로 올린 뒤 폴더를 없앤다.
+    (맨 위 폴더면 results 바로 아래로. 하위 폴더는 안의 구조 그대로 올라감)"""
     import shutil
     src = _res_folder_path(req.name)
     if src == RESULT_DIR or not src.is_dir():
         raise HTTPException(404, f"폴더 없음: {req.name}")
-    csvs = [q for q in src.rglob("*.csv") if q.is_file()]
-    clash = [q.name for q in csvs if (RESULT_DIR / q.name).exists()]
+    parent = src.parent
+    where = f"상위 폴더 '{_res_rel(parent)}'" if parent != RESULT_DIR else "results 바로 아래"
+    items = sorted([q for q in src.iterdir()
+                    if (q.is_file() and q.suffix.lower() == ".csv")
+                    or (q.is_dir() and not _hidden_dir(q.name))],
+                   key=lambda q: (q.is_dir(), q.name.lower()))
+    clash = [q.name + ("(폴더)" if q.is_dir() else "") for q in items if (parent / q.name).exists()]
     if clash:
-        raise HTTPException(409, "results 바로 아래에 같은 이름 파일이 있어 옮길 수 없습니다: "
-                                 + ", ".join(clash[:5]))
+        raise HTTPException(409, f"{where}에 같은 이름이 이미 있어 옮길 수 없습니다: "
+                                 + ", ".join(clash[:5]) + " — 이름을 바꾼 뒤 다시 삭제하세요")
     moved = []
-    for q in csvs:
+    for q in items:
         try:
-            shutil.move(str(q), str(RESULT_DIR / q.name))
+            shutil.move(str(q), str(parent / q.name))
             moved.append(q.name)
         except PermissionError:
-            raise HTTPException(409, f"{q.name}: {_IN_USE_MSG} (이미 옮긴 파일 {len(moved)}개)")
-    left = [x.name for x in src.rglob("*") if x.is_file()]
+            raise HTTPException(409, f"{q.name}: {_IN_USE_MSG} (이미 옮긴 항목 {len(moved)}개)")
+    left = [x.relative_to(src).as_posix() for x in src.rglob("*") if x.is_file()]
     if not left:
         try:
             shutil.rmtree(src)
         except Exception as e:
-            raise HTTPException(409, f"파일은 옮겼지만 폴더를 지우지 못했습니다: {e}")
-    return {"moved": moved, "removed": not left, "left": left[:10]}
+            raise HTTPException(409, f"내용은 옮겼지만 폴더를 지우지 못했습니다: {e}")
+    return {"moved": moved, "removed": not left, "left": left[:10], "to": _res_rel(parent)}
+
+
+@app.post("/api/result-folders/move")
+def move_result_folder(req: ResFolderReq):
+    """폴더를 (안의 내용 그대로) 다른 폴더 안으로 옮김. parent='' → results 바로 아래."""
+    src = _res_folder_path(req.name)
+    if src == RESULT_DIR or not src.is_dir():
+        raise HTTPException(404, f"폴더 없음: {req.name}")
+    dst_parent = _res_folder_path(req.parent)
+    if not dst_parent.is_dir():
+        raise HTTPException(404, f"옮길 곳 폴더 없음: {req.parent}")
+    ns = os.path.normcase(str(src.resolve()))
+    nd = os.path.normcase(str(dst_parent.resolve()))
+    if nd == ns or nd.startswith(ns + os.sep):
+        raise HTTPException(400, "폴더를 자기 자신이나 자기 하위 폴더 안으로 옮길 수 없습니다")
+    if _samefile(src.parent, dst_parent):
+        return {"folder": _res_rel(src), "path": str(src), "moved": False}
+    dst = dst_parent / src.name
+    if dst.exists():
+        raise HTTPException(409, f"옮길 곳에 같은 이름의 폴더(또는 파일)가 이미 있습니다: {src.name}")
+    try:
+        os.rename(src, dst)
+    except PermissionError:
+        raise HTTPException(409, f"폴더 '{src.name}': {_IN_USE_MSG}")
+    except OSError as e:   # 경로가 너무 김(Windows 260자) 등
+        raise HTTPException(400, f"폴더 '{src.name}' 을(를) 옮길 수 없습니다: {e.strerror or e}")
+    return {"folder": _res_rel(dst), "path": str(dst), "moved": True}
 
 
 @app.post("/api/result-files/move")
