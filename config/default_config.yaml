@@ -17,6 +17,7 @@ processing:
   setup_type: "BR"                     # 실험 소스 타입: "BR" | "MX100"
   data_time: "BR"                      # 시간 동기화 기준 소스
   data_sources: ["BR", "AMS", "MX100", "NIDAQ"] # 사용할 소스 (체크박스)
+  ams_format: "csv"                    # 같은 측정의 AMS .dat 와 CSV 가 둘 다 있을 때 읽을 쪽: "csv" | "dat" (.dat 는 같은 폴더 .proj 로 읽음)
 
 # --- 파일 식별 규칙 ---
 # 각 소스별로 파일을 어떻게 구별할지 정의

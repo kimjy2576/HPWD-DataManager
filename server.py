@@ -5,6 +5,7 @@ import os, sys, uuid, time, traceback, re, csv
 from collections import Counter
 from pathlib import Path
 import ams_dat
+import ams_proj
 from io_handler import ams_by_name
 from typing import Optional
 
@@ -563,7 +564,31 @@ def _read_generic_table(path, file_rules=None, src_key="nidaq", default_skip=0, 
     return df
 
 
+# hpwd-studio-task #13 변환 코드(.dat + .proj → AMS_Data.csv)가 만든 CSV 의 특징 열
+_NB_CSV_SIG = frozenset({"motor_direction", "bleach_valve(atomizing)", "Abs(IqeRef)", "filterclean_valve"})
+_NB_CSV_SCALE = (("FanSpeed", "FanSpeed[/100]"), ("SuperHeatDegree", "SuperHeatDegree[*10]"))
+
+
 def read_source_csv(path, file_rules, src_key, default_skip=1, nrows=None):
+    """소스 파일 읽기 (아래 _read_source_raw) + AMS 이름 맞추기.
+
+    변환 코드 CSV 의 'FanSpeed'(값 /100)·'SuperHeatDegree'(값 ×10)는 배율 표기가 없어 앱이 원값으로 써서
+    팬 rpm 이 1/100, 과열도가 10배로 나왔음 → .dat(+.proj) 로 읽을 때와 같은 이름(배율 표기)으로 바꿔
+    AMS 배율 설정이 똑같이 적용되고 변수 표 설정도 .dat/CSV 어느 쪽이든 그대로 맞게 한다."""
+    df = _read_source_raw(path, file_rules, src_key, default_skip, nrows)
+    if src_key == "ams" and df is not None and len(df.columns):
+        cols = set(map(str, df.columns))
+        if len(_NB_CSV_SIG & cols) >= 2:
+            ren = {a: b for a, b in _NB_CSV_SCALE if a in cols and b not in cols}
+            if ren:
+                df = df.rename(columns=ren)
+                msg = (f"  [ams] {os.path.basename(str(path))}: AMS 변환 코드 CSV → "
+                       + ", ".join(f"'{a}'→'{b}'" for a, b in ren.items()) + " (값 그대로, 배율 표기만 — .dat 로 읽을 때와 같은 이름)")
+                print(msg)
+    return df
+
+
+def _read_source_raw(path, file_rules, src_key, default_skip=1, nrows=None):
     """csv/tsv 읽기 — 인코딩 폴백 + 헤더 행 자동 탐지 + 레이아웃 보정.
 
     앱(Merge)·변수 스캔·진단 도구(tools/diagnose.py)가 같은 경로를 쓰도록 모듈 수준에 둠.
@@ -1149,26 +1174,84 @@ def _stem_key(name: str) -> str:
     return _TAG_TAIL.sub("", Path(name).stem.lower())
 
 
+def _ams_twins(case_dir: Path, ams_files: list, file_rules: dict | None, pairs: dict | None) -> dict:
+    """같은 측정의 AMS .dat ↔ CSV 짝 {dat: csv}.
+    ① 앱에서 형식을 학습한 짝  ② 이름이 같음 (AMS_Data.dat ↔ AMS_Data.csv)
+    ③ 이름이 달라도 시간이 대부분 겹치고 변수가 비슷함 (같은 측정을 다른 이름으로 내보낸 CSV).
+       시간이 겹쳐도 변수가 다르면 동시에 기록한 다른 로거라 짝이 아님."""
+    dats = [f for f in ams_files if f.lower().endswith(".dat")]
+    csvs = [f for f in ams_files if f.lower().endswith(".csv")]
+    if not dats or not csvs:
+        return {}
+    by_stem = {_stem_key(c): c for c in csvs}
+    out, used = {}, set()
+    for f in dats:
+        p = (pairs or {}).get(f)
+        twin = p if p in csvs else by_stem.get(_stem_key(f))
+        if twin:
+            out[f] = twin
+            used.add(twin)
+    for f in dats:
+        if f in out:
+            continue
+        sd = _file_span(case_dir / f, "ams", file_rules)
+        if not sd:
+            continue
+        cols_d = _file_head_cols(case_dir / f, "ams", file_rules)
+        best = None
+        for c in csvs:
+            if c in used:
+                continue
+            sc = _file_span(case_dir / c, "ams", file_rules)
+            if not sc:
+                continue
+            try:
+                (a0, a1), (b0, b1) = _span_cmp(sd, sc)
+            except Exception:
+                continue
+            ov, short = min(a1, b1) - max(a0, b0), min(a1 - a0, b1 - b0)
+            if short <= 0 or ov < 0.5 * short:
+                continue
+            if _distinct_cols(cols_d, _file_head_cols(case_dir / c, "ams", file_rules)):
+                continue
+            if best is None or ov > best[0]:
+                best = (ov, c)
+        if best:
+            out[f] = best[1]
+            used.add(best[1])
+    return out
+
+
 def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
                   overrides: dict | None = None, pairs: dict | None = None):
     """케이스 폴더의 파일 판별 + 사용자 선택 적용.
 
     overrides: {파일 이름: 소스키 | None(사용 안 함)} — 화면에서 고른 것. 자동 판별보다 우선.
     pairs: {AMS .dat: 같은 측정 CSV} — 앱에서 형식을 학습한 짝.
-    같은 측정의 AMS CSV 가 함께 있는 AMS 바이너리 .dat 는 기본으로 뺀다 (같은 데이터가 두 번 병합되지 않게).
-    반환: (소스별 파일 {br:[…], …}, 미분류 [{file, why}], 화면용 파일 목록 [{file, size, kind, auto, dflt, src, why, learn, csvs}])"""
+    같은 측정의 AMS .dat 와 CSV 가 함께 있으면 Setting 의 'AMS 파일'(processing.ams_format)에 따라 한쪽만 기본 사용
+    (같은 데이터가 두 번 병합되지 않게). .dat 쪽인데 그 .dat 를 못 읽으면(.proj·학습 형식 없음) CSV 를 씀.
+    반환: (소스별 파일 {br:[…], …}, 미분류 [{file, why}],
+           화면용 파일 목록 [{file, size, kind, auto, dflt, src, why, learn, csvs, via, warn, proj}])"""
     um: list = []
     cf = _classify_files(case_dir, file_rules, sources, unmatched=um)
     auto = {f: k for k, lst in cf.items() for f in lst}
     why = {u["file"]: u["why"] for u in um}
-    ams_csv = {_stem_key(f): f for f in cf.get("ams", []) if f.lower().endswith(".csv")}
-    for f in list(cf.get("ams", [])):
-        if not f.lower().endswith(".dat"):
+    pref = str((DEFAULT_CFG.get("processing") or {}).get("ams_format") or "csv").lower()
+    csv_pref_dats = set()   # Setting 이 CSV 라서 뺀 .dat — 같은 측정 CSV 를 쓰니 형식 학습 안내도 필요 없음
+    for f, twin in _ams_twins(case_dir, cf.get("ams", []), file_rules, pairs).items():
+        if f not in cf["ams"] or twin not in cf["ams"]:
             continue
-        twin = (pairs or {}).get(f) if (pairs or {}).get(f) in cf.get("ams", []) else ams_csv.get(_stem_key(f))
-        if twin:
+        dat_ok = _file_kind(str(case_dir / f))[0] != "binary" or ams_dat.readable(str(case_dir / f)) is not None
+        if pref == "dat" and dat_ok:
+            cf["ams"].remove(twin)
+            why[twin] = f"같은 측정의 .dat({f})를 읽으므로 기본으로 뺌 (Setting › AMS 파일 = .dat) — 체크하면 이 CSV 도 사용"
+        else:
             cf["ams"].remove(f)
-            why[f] = f"같은 측정의 CSV({twin})가 함께 있어 기본으로 뺌 — 체크하면 .dat 를 사용"
+            if pref != "dat":
+                csv_pref_dats.add(f)
+            why[f] = (f"같은 측정의 CSV({twin})를 읽으므로 기본으로 뺌 (Setting › AMS 파일 = CSV) — 체크하면 .dat 도 사용"
+                      if pref != "dat" else
+                      f"Setting › AMS 파일 = .dat 이지만 이 .dat 를 읽을 수 없어 같은 측정의 CSV({twin})를 사용")
     dflt = {f: k for k, lst in cf.items() for f in lst}
     ov = {}
     for f, src in (overrides or {}).items():
@@ -1202,16 +1285,27 @@ def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
         if not e["auto"] and not e["why"]:
             e["why"] = "자동 판별 대상 아님 — 쓰려면 체크하고 소스를 고르세요"
         no_spec = False
+        if kind == "binary" and nl.endswith(".dat"):
+            # 같은 폴더 프로젝트 파일(.proj) 감지 — 있음/이 .dat 와 맞음/이유 (케이스 줄·파일 목록 표시용)
+            pw = []
+            lay = ams_proj.layout_for(x, pw)
+            e["proj"] = {"files": [q.name for q in ams_proj.find_proj(x)],
+                         "match": Path(lay["proj"]).name if lay else None,
+                         "why": "" if lay else (pw[0] if pw else "")}
         if kind == "binary" and nl.endswith(".dat") and (e["auto"] == "ams" or e["src"] == "ams"):
             # AMS 바이너리 .dat — 같은 폴더 .proj 로 읽히거나 학습한 형식이 있어야 읽힘
             how = ams_dat.readable(str(x), size=e["size"])
             no_spec = how is None
             if no_spec:
-                e["warn"] = ("바이너리 .dat 인데 아직 읽을 수 없음 — AMS 측정 폴더의 프로젝트 파일(.proj)을 같은 폴더에 "
-                             "두면 바로 읽힘 (또는 아래에서 같은 측정의 AMS CSV 로 [형식 학습]). 안 하면 병합에서 빠짐")
+                e["warn"] = ("바이너리 .dat 인데 아직 읽을 수 없음 — "
+                             + ("프로젝트 파일(" + ", ".join(e["proj"]["files"]) + ")이 이 .dat 와 맞지 않음"
+                                if e["proj"]["files"] else "같은 폴더에 AMS 프로젝트 파일(.proj)이 없음")
+                             + ". AMS 측정 폴더의 .proj 를 같은 폴더에 두면 바로 읽힘 "
+                               "(또는 아래에서 같은 측정의 AMS CSV 로 [형식 학습]). 안 하면 병합에서 빠짐")
             else:
                 e["via"] = how
-        if nl.endswith(".dat") and kind in ("binary", "excel") and (e["auto"] != "ams" or no_spec):
+        if nl.endswith(".dat") and kind in ("binary", "excel") and (e["auto"] != "ams" or no_spec) \
+                and not (x.name in csv_pref_dats and not e["src"]):
             e["learn"] = True
             k0 = _stem_key(x.name)
             e["csvs"] = sorted(csvs, key=lambda c: (_stem_key(c) != k0, auto.get(c) != "ams", c))

@@ -136,11 +136,21 @@ return(<div className="cd"><div className="ct">데이터 경로</div>
 
 {/* 파일 분류 요약 + 케이스별 파일 선택 */}
 {Object.keys(cf).length>0&&<div style={{marginTop:12}}>{Object.entries(cf).map(([c,f])=>{const multi=Object.values(f).some(v=>v.length>1);const fl=files[c]||[];const op=openC.has(c);const nLearn=fl.filter(e=>e.learn).length;
+// AMS 바이너리 .dat 의 프로젝트 파일(.proj) 감지 결과 — 케이스 줄에 바로 표시
+const projChip=(()=>{const ds=fl.filter(e=>e.proj);if(!ds.length)return null;
+  const okN=ds.filter(e=>e.proj.match).length,hasN=ds.filter(e=>e.proj.files.length).length;
+  const useDat=ds.some(e=>e.src==='ams'),useCsv=fl.some(e=>e.src==='ams'&&/\.csv$/i.test(e.file));
+  const tip=ds.map(e=>`${e.file}: ${e.proj.match?`.proj ✓ ${e.proj.match}`:e.proj.files.length?`.proj 가 이 .dat 와 안 맞음 (${e.proj.files.join(', ')})${e.proj.why?' — '+e.proj.why:''}`:'같은 폴더에 .proj 없음'} · ${e.src==='ams'?'AMS 로 사용':'사용 안 함'+(e.why?' — '+e.why:'')}`).join('\n');
+  let txt,tone;
+  if(okN===ds.length){txt=useDat?'AMS ← .dat (.proj ✓)':useCsv?'AMS ← CSV (.dat·.proj 도 있음)':'.dat·.proj ✓';tone=useDat?'ok':'mute'}
+  else{txt=`.dat ${ds.length-okN}개 ${hasN<ds.length?'.proj 없음':'.proj 안 맞음'}${useCsv?' → AMS ← CSV':''}`;tone=useCsv?'mute':'warn'}
+  const st=tone==='ok'?{background:'rgba(22,163,74,.1)',color:'#16a34a'}:tone==='warn'?{background:'rgba(234,179,8,.14)',color:'#b45309'}:{background:'var(--bg2)',color:'var(--tx3)'};
+  return<span title={tip} style={{fontSize:10,padding:'1px 6px',borderRadius:4,cursor:'help',...st}}>{tone==='warn'?'⚠️ ':''}{txt}</span>})();
 return<div key={c}>
-<div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0',fontSize:12}}><span style={{color:'var(--tx2)',minWidth:200}}>{c}</span><div style={{display:'flex',gap:4,alignItems:'center'}}>{f.br?.length>0&&<span className="ft fb" title={f.br.join('\n')}>BR×{f.br.length}</span>}{f.ams?.length>0&&<span className="ft fa" title={f.ams.join('\n')}>AMS×{f.ams.length}</span>}{f.mx100?.length>0&&<span className="ft fm" title={f.mx100.join('\n')}>MX×{f.mx100.length}</span>}{f.nidaq?.length>0&&<span title={f.nidaq.join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>NIDAQ×{f.nidaq.length}</span>}{unm[c]?.length>0&&<span title={unm[c].map(u=>`${u.file} — ${u.why}`).join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(234,179,8,.14)',color:'#b45309',cursor:'help'}}>미분류×{unm[c].length}</span>}
+<div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0',fontSize:12}}><span style={{color:'var(--tx2)',minWidth:200}}>{c}</span><div style={{display:'flex',gap:4,alignItems:'center'}}>{f.br?.length>0&&<span className="ft fb" title={f.br.join('\n')}>BR×{f.br.length}</span>}{f.ams?.length>0&&<span className="ft fa" title={f.ams.join('\n')}>AMS×{f.ams.length}</span>}{f.mx100?.length>0&&<span className="ft fm" title={f.mx100.join('\n')}>MX×{f.mx100.length}</span>}{f.nidaq?.length>0&&<span title={f.nidaq.join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>NIDAQ×{f.nidaq.length}</span>}{unm[c]?.length>0&&<span title={unm[c].map(u=>`${u.file} — ${u.why}`).join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(234,179,8,.14)',color:'#b45309',cursor:'help'}}>미분류×{unm[c].length}</span>}{projChip}
   {fl.length>0&&<button className="bt bs" style={{fontSize:10,padding:'1px 8px',marginLeft:6}} onClick={()=>setOpenC(p=>{const q=new Set(p);q.has(c)?q.delete(c):q.add(c);return q})} title="이 케이스에서 쓸 파일과 소스를 고릅니다">파일 선택 {op?'▴':'▾'}</button>}
   {plans[c]&&(plans[c].n!==1||plans[c].joined?.length>0||multi)&&<span style={{fontSize:10,color:plans[c].n===0?'#dc2626':'var(--blue)'}} title={(plans[c].runs||[]).map((r,i)=>`${i+1}회: `+['br','ams'].filter(k=>r[k]?.length).map(k=>runDesc(r,k)).join(' / ')).join('\n')}>→ 병합 {plans[c].n}회{plans[c].joined?.length>0?` · ${plans[c].joined.join(', ')}`:''}</span>}
-  {nLearn>0&&!op&&<span style={{fontSize:10,color:'#b45309'}}>.dat {nLearn}개 형식 학습 필요</span>}
+  {nLearn>0&&!op&&!projChip&&<span style={{fontSize:10,color:'#b45309'}}>.dat {nLearn}개 형식 학습 필요</span>}
   {Object.keys(ovr[c]||{}).length>0&&<span style={{fontSize:10,color:'var(--blue)'}}>직접 고름 {Object.keys(ovr[c]).length}개</span>}
 </div></div>
 {op&&<div style={{margin:'2px 0 8px 12px',padding:'6px 10px',borderLeft:'2px solid var(--bd)',fontSize:11}}>
@@ -169,7 +179,7 @@ return<div key={c}>
       {e.auto&&e.src&&e.auto!==e.src&&<span style={{color:'var(--tx3)'}}>(자동 판별: {e.auto.toUpperCase()})</span>}
       {e.why&&!e.src&&<span style={{color:'#b45309'}}>{e.why}</span>}
       {e.warn&&e.src&&<span style={{color:'#b45309'}}>⚠️ {e.warn}</span>}
-      {e.via&&e.src&&<span style={{color:'var(--tx3)'}}>({e.via} 로 읽음)</span>}
+      {e.via&&<span style={{color:'var(--tx3)'}}>({e.via} 로 {e.src?'읽음':'읽을 수 있음'})</span>}
     </div>
     {e.learn&&<div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',margin:'3px 0 4px 22px'}}>
       <span style={{color:'var(--tx2)'}}>AMS 측정 폴더의 프로젝트 파일(.proj)을 이 폴더에 넣으면 바로 읽힘 · 없으면 형식 학습 — 같은 측정을 AMS 에서 내보낸 CSV:</span>
@@ -3111,6 +3121,11 @@ return(<div><div className="fg"><div>
 <div className="fr"><div className="fl">사용 소스</div><div className="fi" style={{display:'flex',gap:12}}>
 {['BR','AMS','MX100','NIDAQ'].map(src=>{const ds=l?.processing?.data_sources||[];const on=ds.includes(src);return<label key={src} style={{display:'flex',alignItems:'center',gap:4,fontSize:13,cursor:'pointer'}}><input type="checkbox" checked={on} onChange={()=>{const cur=l?.processing?.data_sources||[];s('processing.data_sources',on?cur.filter(x=>x!==src):[...cur,src])}} style={{accentColor:'var(--teal)',width:15,height:15}}/>{src}</label>})}
 </div></div>
+<div className="fr"><div className="fl">AMS 파일</div><div className="fi"><select value={l?.processing?.ams_format||'csv'} onChange={e=>s('processing.ams_format',e.target.value)}>
+<option value="dat">.dat 로 읽기 — 측정 원본 (같은 폴더 .proj 로 읽음)</option>
+<option value="csv">CSV 로 읽기 — AMS 프로그램·변환 코드로 내보낸 파일</option>
+</select></div></div>
+<div style={{fontSize:10,color:'var(--tx3)',margin:'-2px 0 8px'}}>같은 측정의 AMS .dat 와 CSV 가 둘 다 있을 때 어느 쪽을 읽을지 정합니다 (이름이 같거나, 시간이 겹치고 변수가 비슷하면 같은 측정으로 봄). 한쪽만 있으면 그 파일을 읽고, .dat 를 못 읽으면(.proj 없음) CSV 를 씁니다. 바꾼 뒤에는 Merge 탭에서 케이스 확정을 다시 누르세요.</div>
 <CfgField lb="기준 시간축" p="processing.data_time" o={['BR','AMS','MX100','NIDAQ']} {...fp}/><CfgField lb="필터 모드" p="processing.filter_mode" o={['Dry_Only','Wash_and_Dry']} {...fp}/><CfgField lb="리샘플링" p="processing.time_interval" t="number" u="초" {...fp}/></div>
 <div className="cd"><div className="ct">시작 트림</div>
 <div style={{fontSize:10,color:'var(--tx3)',marginBottom:6}}>특정 변수가 기준값 이상인 시점부터 데이터를 사용합니다. 비활성 시 SW_ProtectionCount 기반.</div>
