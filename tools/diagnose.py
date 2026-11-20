@@ -605,9 +605,13 @@ def diagnose_binary(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool,
     lay = P.layout_for(path, why)
     if lay is not None:
         df, _ = quiet(P.read, path, None, lambda *a: None, lay)
-        R.flag("ok", f"프로젝트 파일 {Path(lay['proj']).name} 의 채널 배치와 일치 → 앱에서 AMS 로 바로 읽힘 (학습 불필요): "
-                     f"{len(df):,}행 × {len(df.columns)}열, 기록 {lay['rec']}바이트")
+        R.flag("warn" if lay.get("weak") else "ok",
+               f"프로젝트 파일 {Path(lay['proj']).name} 의 채널 배치로 앱에서 AMS 로 바로 읽힘 (학습 불필요): "
+               f"{len(df):,}행 × {len(df.columns)}열, 기록 {lay['rec']}바이트"
+               + (" — 시각 값을 확인하지 못해 원 코드처럼 그대로 읽음" if lay.get("weak") else ""))
         R.add(f"    확인: {lay['check']}")
+        R.add(f"    시각 기준일: {lay.get('epoch') or '알 수 없음 → 원 코드처럼 시:분:초만'}"
+              + (f" | .proj 계산 기록 {lay['rec_proj']}바이트 → 실제 {lay['rec']}바이트" if lay['rec'] != lay.get('rec_proj') else ""))
         if not mask and len(df):
             R.add(f"    시각 {df['Time'].iloc[0]} ~ {df['Time'].iloc[-1]}")
             R.add("    계측 채널: " + (", ".join(c for c, _, _ in lay["chans"][:20]) or "없음"))

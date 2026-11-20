@@ -1298,7 +1298,7 @@ def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
             no_spec = how is None
             if no_spec:
                 e["warn"] = ("바이너리 .dat 인데 아직 읽을 수 없음 — "
-                             + ("프로젝트 파일(" + ", ".join(e["proj"]["files"]) + ")이 이 .dat 와 맞지 않음"
+                             + ((e["proj"]["why"] or "프로젝트 파일(" + ", ".join(e["proj"]["files"]) + ")이 이 .dat 와 맞지 않음")
                                 if e["proj"]["files"] else "같은 폴더에 AMS 프로젝트 파일(.proj)이 없음")
                              + ". AMS 측정 폴더의 .proj 를 같은 폴더에 두면 바로 읽힘 "
                                "(또는 아래에서 같은 측정의 AMS CSV 로 [형식 학습]). 안 하면 병합에서 빠짐")

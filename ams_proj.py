@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 SKIP_FIRST = 11          # 원 코드: cnt > 10 부터 기록
-_TS_MIN, _TS_MAX = 9.46e8, 4.1e9   # 2000 ~ 2099 년 (Unix 초)
+_TS_WIN_MAX = 32536799999.0       # Windows 에서 datetime.fromtimestamp() 가 되는 최대값 (원 코드가 읽히는 범위)
 _LAYOUT_CACHE: dict = {}
 
 # 원 코드의 계측 채널 이름 정리 규칙 (위에서부터 차례로)
@@ -171,9 +171,30 @@ def parse_proj(path) -> dict:
 # ──────────────────────────────────────────────
 #  배치 확인 (.dat 와 맞는지)
 # ──────────────────────────────────────────────
+_SMALL_FILE = 8 << 20     # 이보다 작은 파일은 한 번에 읽어 메모리에서 자름 (네트워크 드라이브에서 여러 번 seek 하지 않게)
+_HEAD_CACHE: dict = {}
+
+
 def _read_records(path, rec: int, idx) -> np.ndarray:
     """기록 번호 idx 들의 바이트 (k, rec) — 필요한 부분만 읽음."""
     out = np.zeros((len(idx), rec), np.uint8)
+    try:
+        stt = Path(path).stat()
+    except OSError:
+        return out
+    if stt.st_size <= _SMALL_FILE:
+        key = (str(path), stt.st_size, stt.st_mtime)
+        buf = _HEAD_CACHE.get(key)
+        if buf is None:
+            buf = Path(path).read_bytes()
+            _HEAD_CACHE.clear()
+            _HEAD_CACHE[key] = buf
+        a = np.frombuffer(buf, np.uint8)
+        for j, i in enumerate(idx):
+            s = int(i) * rec
+            if s + rec <= len(a):
+                out[j] = a[s:s + rec]
+        return out
     with open(path, "rb") as f:
         for j, i in enumerate(idx):
             f.seek(int(i) * rec)
@@ -183,27 +204,71 @@ def _read_records(path, rec: int, idx) -> np.ndarray:
     return out
 
 
-def _check(path, size: int, rec: int, stx) -> tuple:
+def _ts_ok(ts: np.ndarray) -> np.ndarray:
+    """시각으로 쓸 수 있는 값 — 원 코드 datetime.fromtimestamp() 가 되는 범위 (0 < 초 < Windows 한계).
+    0 으로 채운 기록(파일 끝에 미리 잡아 둔 자리 등)은 여기서 걸러짐."""
+    return np.isfinite(ts) & (ts > 1.0) & (ts < _TS_WIN_MAX)
+
+
+def _check(path, size: int, rec: int, stx) -> dict:
+    """이 기록 길이로 읽었을 때 시각 열이 시각처럼 보이는지 — 원 코드는 아무 확인 없이 읽으므로
+    '틀린 배치를 거르는' 정도로만 느슨하게 본다 (0 으로 채운 기록·다른 기준일·바뀌는 STX 바이트는 허용)."""
     n = size // rec
-    if n < 2:
-        return False, f"기록 {rec}바이트로 나누면 {n}개"
-    idx = np.unique(np.linspace(0, n - 1, min(n, 64)).astype(np.int64))
+    out = {"rec": rec, "n": n, "rem": size - n * rec, "valid": 0.0, "mono": 0.0, "stx": None, "step": None,
+           "ok": False, "score": 0.0}
+    if n < 1:
+        return out
+    idx = np.unique(np.linspace(0, n - 1, min(n, 160)).astype(np.int64))
     R = _read_records(path, rec, idx)
     ts = np.ascontiguousarray(R[:, :8]).view("<f8").ravel()
-    good = np.isfinite(ts) & (ts > _TS_MIN) & (ts < _TS_MAX)
-    frac = float(good.mean())
-    d = np.diff(ts[good])
-    mono = float((d >= -1.0).mean()) if len(d) else 0.0
-    stx_ok = 1.0
-    if stx is not None and stx < rec:
-        v = R[:, stx]
-        stx_ok = float(np.bincount(v).max() / len(v))
-    ok = frac >= 0.95 and mono >= 0.95 and stx_ok >= 0.9
-    return ok, f"시각 정상 {frac*100:.0f}% · 증가 {mono*100:.0f}% · STX 일정 {stx_ok*100:.0f}%"
+    good = _ts_ok(ts)
+    out["valid"] = float(good.mean())
+    v, iv = ts[good], idx[good]
+    out["t_med"] = float(np.median(v)) if len(v) else None
+    if len(v) >= 2:
+        out["mono"] = float((np.diff(v) >= -1.0).mean())
+        span_rec = float(iv[-1] - iv[0])
+        out["step"] = float((v[-1] - v[0]) / span_rec) if span_rec > 0 else None   # 기록 하나당 초
+    elif len(v) == 1 and n == 1:
+        out["mono"] = 1.0
+    if stx is not None and stx < rec and good.any():
+        b = R[good, stx]
+        out["stx"] = float(np.bincount(b).max() / len(b))
+    step_ok = out["step"] is None or 1e-4 <= out["step"] <= 600
+    # 절반 넘는 기록에 시각 값이 있고, 그 시각이 대부분 늘어나고, 기록 간격이 그럴듯하면 맞는 배치
+    out["ok"] = out["valid"] >= 0.5 and out["mono"] >= 0.9 and step_ok
+    out["score"] = (out["valid"] + out["mono"] + 0.5 * (out["stx"] or 0) + (0.3 if out["rem"] == 0 else 0)
+                    + (0.2 if step_ok else 0))
+    return out
+
+
+def _check_text(c: dict) -> str:
+    s = (f"기록 {c['rec']}바이트로 읽으면 시각 값 있음 {c['valid']*100:.0f}% · 증가 {c['mono']*100:.0f}%"
+         + (f" · 기록 간격 {c['step']:.3g}초" if c.get("step") else "")
+         + (f" · STX 바이트 일정 {c['stx']*100:.0f}%" if c.get("stx") is not None else "")
+         + (f" · 파일 끝 {c['rem']}바이트 남음" if c.get("rem") else ""))
+    return s
+
+
+# 시각 값의 기준일 후보 — 원 코드는 시:분:초만 쓰므로 기준일이 달라도 (하루 단위 차이라) 시각은 같음.
+# 날짜까지 넣기 위해 2000~2046 년이 되는 기준일을 고름. 못 고르면 원 코드처럼 시각만.
+_EPOCHS = (("Unix 1970", 0.0), ("1904 (LabVIEW·Mac)", -2082844800.0), ("1900", -2208988800.0),
+           ("1601 (Windows)", -11644473600.0))
+
+
+def _pick_epoch(t: float):
+    for name, off in _EPOCHS:
+        if 9.46e8 <= t + off <= 2.4e9:
+            return name, off
+    return None, None
 
 
 def layout_for(dat_path, why: list | None = None) -> dict | None:
-    """.dat 에 맞는 .proj 배치 → 배치 dict (+ 실제 기록 길이) | None (why 에 이유)."""
+    """.dat 에 맞는 .proj 배치 → 배치 dict | None (why 에 이유).
+
+    원 코드처럼 .proj 로 계산한 기록 길이로 읽는다. .proj 가 여럿이거나 AMS 버전에 따라 끝 바이트가 없을 수 있어
+    후보(.proj × 기록 길이 ±1)를 _check 로 견줘 가장 그럴듯한 것을 고르고,
+    시각 확인이 안 돼도 .proj 계산 길이가 파일 크기를 딱 나누면 원 코드처럼 그대로 읽는다."""
     p = Path(dat_path)
     try:
         st = p.stat()
@@ -219,32 +284,46 @@ def layout_for(dat_path, why: list | None = None) -> dict | None:
     key = (str(p), st.st_size, st.st_mtime,
            tuple((str(q), q.stat().st_mtime) for q in projs if q.exists()))
     if key in _LAYOUT_CACHE:
-        L = _LAYOUT_CACHE[key]
-        if L is None and why is not None:
-            why.append("프로젝트 파일(.proj)의 채널 배치가 이 .dat 와 맞지 않음")
-        return L
-    found, notes = None, []
+        found, reason = _LAYOUT_CACHE[key]
+        if found is None and why is not None:
+            why.append(reason)
+        return found
+    cands, notes = [], []
     for q in projs:
         try:
             L = parse_proj(q)
         except Exception as e:
-            notes.append(f"{q.name}: {e}")
+            notes.append(f"{q.name}: 읽을 수 없음 ({e})")
             continue
-        # 원 코드 배치(끝 1바이트 포함) 먼저, 안 맞으면 ±1 바이트 (AMS 버전 차이 대비)
-        for rec in (L["rec"], L["rec"] - 1, L["rec"] + 1):
+        for k, rec in enumerate((L["rec"], L["rec"] - 1, L["rec"] + 1)):
             if rec < 9:
                 continue
-            ok, info = _check(p, st.st_size, rec, L["stx"])
-            if ok:
-                found = dict(L, rec=rec, rec_proj=L["rec"], check=info)
-                break
-            if rec == L["rec"]:
-                notes.append(f"{q.name}: 기록 {rec}바이트로 읽으면 {info}")
-        if found:
-            break
-    _LAYOUT_CACHE[key] = found
+            c = _check(p, st.st_size, rec, L["stx"])
+            cands.append((q, L, c, k))
+            if k == 0:
+                notes.append(f"{q.name}: " + _check_text(c))
+                if c["ok"]:
+                    break          # .proj 계산 길이로 맞으면 ±1 은 안 봄
+    good = [x for x in cands if x[2]["ok"]]
+    pick, weak = None, False
+    if good:   # .proj 계산 길이 그대로(k=0)를 조금 우대
+        pick = max(good, key=lambda x: x[2]["score"] + (0.25 if x[3] == 0 else 0.0))
+    else:
+        exact = [x for x in cands if x[3] == 0 and x[2]["rem"] == 0 and x[2]["n"] >= 1]
+        if exact:
+            pick, weak = exact[0], True
+    if pick is None:
+        found = None
+        reason = "프로젝트 파일(.proj)의 채널 배치가 이 .dat 와 맞지 않음 — " + " / ".join(notes[:3])
+    else:
+        q, L, c, k = pick
+        ep_name, ep_off = _pick_epoch(c["t_med"]) if c.get("t_med") is not None else (None, None)
+        found = dict(L, rec=c["rec"], rec_proj=L["rec"], check=_check_text(c), weak=weak,
+                     epoch=ep_name, epoch_off=ep_off)
+        reason = ""
+    _LAYOUT_CACHE[key] = (found, reason)
     if found is None and why is not None:
-        why.append("프로젝트 파일(.proj)의 채널 배치가 이 .dat 와 맞지 않음 — " + " / ".join(notes[:3]))
+        why.append(reason)
     return found
 
 
@@ -336,11 +415,18 @@ def _smart_columns(P: np.ndarray) -> list:
 # ──────────────────────────────────────────────
 #  읽기
 # ──────────────────────────────────────────────
-def _times(ts: np.ndarray) -> pd.Series:
-    """Unix 초 (현지 시각을 UTC 처럼 저장) → '2026-11-20 10:00:00.123' (밀리초까지, 원 코드 round(·, 3))."""
-    ok = np.isfinite(ts) & (ts > _TS_MIN) & (ts < _TS_MAX)
-    ms = np.where(ok, np.rint(np.where(ok, ts, 0.0) * 1000.0), 0).astype(np.int64)
-    s = pd.Series(pd.to_datetime(ms, unit="ms").strftime("%Y-%m-%d %H:%M:%S.%f").str[:23], dtype=object)
+def _times(ts: np.ndarray, off) -> pd.Series:
+    """시각 값 → 글자. 기준일(off: Unix 초로 바꾸는 더하기 값)을 알면 '2026-11-20 10:00:00.123',
+    모르면 원 코드처럼 시각만 '10:00:00.123'. 현지 시각을 UTC 처럼 저장한 값이라 UTC 로 풀면 현지 시각."""
+    ok = _ts_ok(ts)
+    t = np.where(ok, ts, 0.0)
+    if off is None:
+        ms = np.mod(np.rint(t * 1000.0), 86_400_000).astype(np.int64)
+        s = pd.Series(pd.to_datetime(ms, unit="ms").strftime("%H:%M:%S.%f").str[:12], dtype=object)
+    else:
+        ms = np.rint((t + off) * 1000.0).astype(np.int64)
+        ms[~ok] = 0
+        s = pd.Series(pd.to_datetime(ms, unit="ms").strftime("%Y-%m-%d %H:%M:%S.%f").str[:23], dtype=object)
     s[~ok] = None
     return s
 
@@ -360,7 +446,7 @@ def read(dat_path, nrows: int | None = None, log=print, layout: dict | None = No
         return pd.DataFrame()
     A = np.frombuffer(buf, np.uint8, count=n * rec).reshape(n, rec)
     ts = np.ascontiguousarray(A[:, :8]).view("<f8").ravel()
-    cols = {"Time": _times(ts)}
+    cols = {"Time": _times(ts, L.get("epoch_off"))}
     held = []
     if L["stx"] is not None:
         P = A[:, L["stx"]:min(L["etx"], rec)]
@@ -375,25 +461,65 @@ def read(dat_path, nrows: int | None = None, log=print, layout: dict | None = No
         v = np.where(np.isfinite(v), np.trunc(v * 1000) / 1000, np.nan)   # 원 코드 int(val*1000)/1000
         cols[name if name not in cols else name + "_ch"] = v
     df = pd.DataFrame(cols)
-    if n > SKIP_FIRST:
-        df = df.iloc[SKIP_FIRST:].reset_index(drop=True)
+    keep = _ts_ok(ts)
+    if n > SKIP_FIRST:                       # 원 코드: 처음 11개 기록은 버림
+        keep[:SKIP_FIRST] = False
+    n_bad = int((~_ts_ok(ts[SKIP_FIRST:] if n > SKIP_FIRST else ts)).sum())
+    df = df[keep].reset_index(drop=True)     # 시각 값이 없는 기록(0 으로 채운 자리 등)은 뺌 — 원 코드는 00:00:00 으로 씀
     # 원 코드는 처음 11개 기록 안에 안 나온 패킷 종류가 있으면 멈춤 → 여기선 그 값들만 처음 나온 값으로 앞을 채움
     if held and len(df):
         df[held] = df[held].bfill()
     if nrows is not None:
         df = df.head(int(nrows))
-    bad = int((~(np.isfinite(ts) & (ts > _TS_MIN) & (ts < _TS_MAX))).sum())
     log(f"  [ams_dat] {p.name}: 프로젝트 파일 {Path(L['proj']).name} 의 채널 배치로 읽음 "
         f"({len(df):,}행 × {len(df.columns)}열, 기록 {rec}바이트"
         f"{', 계측 채널 ' + str(len(L['chans'])) + '개' if L['chans'] else ''}"
         f"{', 스마트 패킷 ' + str(L['etx'] - L['stx']) + '바이트' if L['stx'] is not None else ''}"
-        f"{f', 시각 이상 기록 {bad}개' if bad else ''}"
-        f"{', 끝 바이트 차이 보정' if rec != L.get('rec_proj', rec) else ''})")
+        f"{f', 시각 값 없는 기록 {n_bad:,}개 뺌' if n_bad else ''}"
+        f"{', 끝 바이트 차이 보정' if rec != L.get('rec_proj', rec) else ''}"
+        f"{', 시각 기준일 ' + L['epoch'] if L.get('epoch') and L['epoch'] != 'Unix 1970' else ''}"
+        f"{', 날짜를 알 수 없어 시각만' if not L.get('epoch') else ''})")
+    if L.get("weak"):
+        log(f"  [ams_dat] {p.name}: ⚠️ 시각 값이 예상과 달라 확인하지 못하고 원 코드처럼 그대로 읽음 — {L.get('check', '')}")
     return df
 
 
+def _valid_ends(path, rec: int, n: int):
+    """시각 값이 있는 처음·마지막 기록의 시각 (원 코드처럼 처음 11개 기록은 건너뜀). 없으면 None."""
+    lo = SKIP_FIRST if n > SKIP_FIRST else 0
+    idx = np.unique(np.concatenate([np.arange(lo, min(n, lo + 32)),
+                                    np.linspace(lo, n - 1, max(1, min(n - lo, 256))).astype(np.int64),
+                                    np.arange(max(lo, n - 32), n)]))
+    R = _read_records(path, rec, idx)
+    ts = np.ascontiguousarray(R[:, :8]).view("<f8").ravel()
+    ok = _ts_ok(ts)
+    if not ok.any():
+        return None
+    good = idx[ok]
+
+    def refine(a, b, last):          # a < b 사이 기록을 다 읽어 경계를 정확히
+        seg = np.arange(a + 1, b)
+        if not len(seg):
+            return None
+        t2 = np.ascontiguousarray(_read_records(path, rec, seg)[:, :8]).view("<f8").ravel()
+        k = np.flatnonzero(_ts_ok(t2))
+        return None if not len(k) else (seg[k[-1]], t2[k[-1]]) if last else (seg[k[0]], t2[k[0]])
+
+    i0, t0 = good[0], ts[ok][0]
+    prev = idx[idx < i0]
+    r = refine(prev[-1], i0, False) if len(prev) else None
+    if r:
+        i0, t0 = r
+    i1, t1 = good[-1], ts[ok][-1]
+    nxt = idx[idx > i1]
+    r = refine(i1, nxt[0], True) if len(nxt) else None
+    if r:
+        i1, t1 = r
+    return float(t0), float(t1)
+
+
 def time_bounds(dat_path) -> dict | None:
-    """첫·마지막 기록 시각 → {"kind": "abs", "start", "end"} (현지 시각 기준 초) | None."""
+    """첫·마지막 기록 시각 → {"kind": "abs"|"tod", "start", "end"} (현지 시각 기준 초) | None."""
     p = Path(dat_path)
     L = layout_for(p)
     if L is None:
@@ -402,15 +528,20 @@ def time_bounds(dat_path) -> dict | None:
     n = p.stat().st_size // rec
     if n < 1:
         return None
-    first = min(SKIP_FIRST, n - 1)
-    R = _read_records(p, rec, [first, n - 1])
-    ts = np.ascontiguousarray(R[:, :8]).view("<f8").ravel()
-    if not np.all(np.isfinite(ts)):
+    ends = _valid_ends(p, rec, n)
+    if ends is None:
         return None
-    return {"kind": "abs", "start": float(np.round(ts[0], 3)), "end": float(np.round(ts[1], 3))}
+    if L.get("epoch_off") is not None:
+        t0, t1 = (round(x + L["epoch_off"], 3) for x in ends)
+        return {"kind": "abs", "start": t0, "end": t1}
+    t0, t1 = (round(x, 3) for x in ends)
+    s0, s1 = t0 % 86400.0, t1 % 86400.0      # 기준일을 모르면 원 코드처럼 하루 중 시각
+    return {"kind": "tod", "start": s0, "end": s1 + (86400.0 if s1 < s0 else 0.0)}
 
 
 def describe(dat_path) -> str | None:
     """읽을 수 있으면 짧은 설명 ('프로젝트 파일 X.proj'), 아니면 None."""
     L = layout_for(dat_path)
-    return f"프로젝트 파일 {Path(L['proj']).name}" if L else None
+    if not L:
+        return None
+    return f"프로젝트 파일 {Path(L['proj']).name}" + (" (시각 확인 못 함)" if L.get("weak") else "")
