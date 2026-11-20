@@ -1194,6 +1194,48 @@ def _rec_ok(rec: np.ndarray, spec: dict) -> bool:
     return (np.mean(ins) >= 0.6) if ins else True
 
 
+def time_bounds(path) -> dict | None:
+    """학습한 형식으로 첫·마지막 기록의 시각 → {"kind": "abs"|"tod", "start", "end"} (초, 현지 시각 기준).
+    여러 .dat 를 이어 붙일지·어느 BR 과 짝지을지 정하는 데 씀. 경과 시간뿐이면 None."""
+    buf = read_bytes(path)
+    sp, st = find_spec(path, head=buf)
+    if sp is None:
+        return None
+    a = np.frombuffer(buf, np.uint8)
+    p = int(sp["record_len"])
+    n = (len(a) - st) // p
+    if n < 1:
+        return None
+    R = a[st:st + n * p].reshape(n, p)
+    t, kd, head = sp["time"], sp["time"]["kind"], bytes(buf[:st])
+    ends = R[[0, n - 1]]
+    if kd in ("filetime", "ticks", "unix_s", "unix_ms", "unix_us", "ole"):
+        u = _abs_time(_field(ends, t["offset"], t["dtype"]), kd) + t.get("tz", 0.0)
+        return {"kind": "abs", "start": float(u[0]), "end": float(u[1])}
+    if kd == "systemtime":
+        v = np.ascontiguousarray(ends[:, t["offset"]:t["offset"] + 16]).view(np.dtype(t["dtype"])).reshape(2, 8)
+        u = [(pd.Timestamp(year=int(x[0]), month=int(x[1]), day=int(x[3]), hour=int(x[4]), minute=int(x[5]),
+                           second=int(x[6])) - pd.Timestamp("1970-01-01")).total_seconds() + x[7] / 1000.0 for x in v]
+        return {"kind": "abs", "start": float(u[0]), "end": float(u[1])}
+    if kd == "hms_u1":
+        x = ends[:, t["offset"]:t["offset"] + 3].astype(float)
+        hh, mi, ss = (x[:, 0], x[:, 1], x[:, 2]) if t["order"] == "hms" else (x[:, 2], x[:, 1], x[:, 0])
+        s0, s1 = hh * 3600 + mi * 60 + ss
+        return {"kind": "tod", "start": float(s0), "end": float(s1 + (86400 if s1 < s0 else 0))}
+    st0 = _header_time(head, t.get("start_from"))
+    if st0 is None:
+        return None
+    if kd == "counter":
+        raw = _field(R, t["offset"], t["dtype"]).astype(np.float64)
+        d = np.diff(raw)
+        if t["dtype"][-2] in "ui":
+            d[d < 0] += float(1 << (8 * np.dtype(t["dtype"]).itemsize))
+        return {"kind": "abs", "start": float(st0), "end": float(st0 + d.sum() * t["unit_s"])}
+    if kd == "index":
+        return {"kind": "abs", "start": float(st0), "end": float(st0 + (n - 1) * t["interval_s"])}
+    return None
+
+
 def read_dat(path, nrows: int | None = None, log=print) -> pd.DataFrame:
     """학습된 형식으로 AMS .dat 읽기. 맞는 형식이 없으면 빈 DataFrame."""
     buf = read_bytes(path)

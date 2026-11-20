@@ -1201,10 +1201,224 @@ def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
     return cf, um, entries
 
 
+# ── 여러 파일 → 병합 회차 계획 ───────────────────────────
+# BR·AMS 파일마다 첫·마지막 시각을 읽어서
+#   · 시간이 이어지는 파일(로그가 여러 파일로 나뉜 것)은 하나로 이어 붙이고
+#   · 다른 소스 파일은 시간이 겹치는 회차에 배정한다.
+# 시각을 모르는 파일(경과 시간 등)은 예전처럼 i번째끼리 짝짓는다.
+_RX_HAS_DATE = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}")
+_RX_HMS = re.compile(r"^\s*(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)\s*$")
+_SPAN_CACHE: dict = {}
+_SEG_GAP_S = 1800          # 이 이내로 이어지면 같은 시험의 조각으로 봄 (30분)
+_BR_TIME_COLS = ("LogTime", "logtime", "Log Time", "Time", "DateTime", "Timestamp")
+
+
+def _parse_time_str(v):
+    """시각 글자 → ('abs', 1970 기준 초) | ('tod', 하루 중 초) | None (경과 시간 등)."""
+    t = str(v).strip().strip('"')
+    if not t or t.lower() == "nan":
+        return None
+    if _RX_HAS_DATE.search(t):
+        ts = pd.to_datetime(t, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return "abs", (ts.tz_localize(None) if ts.tzinfo else ts).value / 1e9
+    m = _RX_HMS.match(t)
+    if m:
+        return "tod", int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3])
+    return None
+
+
+def _tail_lines(path: str, enc: str | None, nbytes: int = 65536) -> list:
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - nbytes))
+        chunk = f.read()
+    lines = chunk.decode(enc or "utf-8", errors="replace").splitlines()
+    return [ln for ln in lines[1:] if ln.strip()] if size > nbytes else [ln for ln in lines if ln.strip()]
+
+
+def _file_span(path: Path, src: str, file_rules: dict | None):
+    """BR/AMS 파일의 첫·마지막 시각 → {"kind": "abs"|"tod", "start", "end"} (초) | None (모름)."""
+    path = Path(path)
+    try:
+        stt = path.stat()
+    except OSError:
+        return None
+    key = (str(path), src, stt.st_mtime, stt.st_size)
+    if key in _SPAN_CACHE:
+        return _SPAN_CACHE[key]
+    span = None
+    try:
+        import contextlib, io
+        p = str(path)
+        kind, enc = _file_kind(p)
+        if src == "ams" and kind == "binary":
+            span = ams_dat.time_bounds(p)
+        elif kind == "text":
+            with contextlib.redirect_stdout(io.StringIO()):
+                head = read_source_csv(p, file_rules or {}, src, 1, nrows=5)
+            _READ_NOTES.clear()
+            if head is not None and not head.empty:
+                cols = [str(c) for c in head.columns]
+                if src == "br":
+                    tc = next((c for c in _BR_TIME_COLS if c in cols), cols[0])
+                else:
+                    tc = "Time" if "Time" in cols else cols[0]
+                first = next((r for r in (_parse_time_str(v) for v in head[tc]) if r), None)
+                if first:
+                    idx = cols.index(tc)
+                    if p.lower().endswith(".tsv"):
+                        sep = "\t"
+                    elif p.lower().endswith(".csv"):
+                        sep = ","
+                    else:
+                        st_ = _sniff_table(p, enc)
+                        sep = st_["sep"] if st_ else ","
+                    last = None
+                    for ln in reversed(_tail_lines(p, enc)[-30:]):
+                        cells = _split_cells(ln, sep)
+                        if idx < len(cells):
+                            r = _parse_time_str(cells[idx])
+                            if r and r[0] == first[0]:
+                                last = r
+                                break
+                    if last:
+                        a0, a1 = first[1], last[1]
+                        if first[0] == "tod" and a1 < a0:
+                            a1 += 86400.0
+                        span = {"kind": first[0], "start": float(a0), "end": float(a1)}
+    except Exception:
+        span = None
+    _SPAN_CACHE[key] = span
+    return span
+
+
+def _span_cmp(a: dict, b: dict):
+    """두 시각 범위를 같은 기준으로 (둘 다 날짜가 있으면 날짜까지, 아니면 하루 중 시각으로)."""
+    if a["kind"] == "abs" and b["kind"] == "abs":
+        return (a["start"], a["end"]), (b["start"], b["end"])
+
+    def tod(x):
+        if x["kind"] == "tod":
+            return x["start"], x["end"]
+        s0 = x["start"] % 86400.0
+        return s0, s0 + (x["end"] - x["start"])
+    return tod(a), tod(b)
+
+
+def _ref_source(cf: dict, dt: str, sources: list):
+    """기준 시간축 소스 (설정한 기준 소스 파일이 없으면 BR → AMS → MX100 → NIDAQ 순으로 대체)."""
+    ref_map = {"BR": "br", "AMS": "ams", "MX100": "mx100", "NIDAQ": "nidaq"}
+    if dt in sources and cf.get(ref_map.get(dt, "br")):
+        return dt, ref_map[dt]
+    for alt in ("BR", "AMS", "MX100", "NIDAQ"):
+        if alt in sources and cf.get(ref_map[alt]):
+            return alt, ref_map[alt]
+    return None, None
+
+
+def _plan_runs(case_dir: Path, cf: dict, ref_key: str | None, file_rules: dict | None, mode: str = "auto"):
+    """병합 회차 → ([{"br": [...], "ams": [...]}, ...], 설명 줄).
+
+    mode: auto(시간으로 판단) | concat(소스마다 전부 이어 붙여 1회) | separate(예전처럼 i번째끼리 짝)"""
+    notes = []
+    if ref_key is None:
+        return [], notes
+    if ref_key not in ("br", "ams"):
+        return [{"br": [], "ams": []}], notes
+    other = "ams" if ref_key == "br" else "br"
+    R, O = list(cf.get(ref_key, [])), list(cf.get(other, []))
+    spans = {(k, f): _file_span(case_dir / f, k, file_rules) for k, lst in ((ref_key, R), (other, O)) for f in lst}
+    by_start = lambda k: (lambda f: (spans.get((k, f)) is None, (spans.get((k, f)) or {}).get("start", 0), f))
+
+    if mode == "separate":
+        return [{ref_key: [f], other: [O[i]] if i < len(O) else []} for i, f in enumerate(R)], notes
+    if mode == "concat":
+        return [{ref_key: sorted(R, key=by_start(ref_key)), other: sorted(O, key=by_start(other))}], notes
+
+    # ① 기준 파일: 시간이 이어지면 한 회차로
+    if R and all(spans.get((ref_key, f)) for f in R):
+        Rs = sorted(R, key=by_start(ref_key))
+        groups = [[Rs[0]]]
+        for f in Rs[1:]:
+            prev, cur = _span_cmp(spans[(ref_key, groups[-1][-1])], spans[(ref_key, f)])
+            gap = cur[0] - prev[1]
+            if -60 <= gap <= _SEG_GAP_S:
+                groups[-1].append(f)
+            else:
+                groups.append([f])
+    else:
+        groups = [[f] for f in R]
+        if len(R) > 1:
+            notes.append(f"{ref_key.upper()} 파일 시각을 읽지 못한 것이 있어 파일마다 따로 병합")
+    runs = [{ref_key: g, other: []} for g in groups]
+
+    def run_span(g):
+        ss = [spans.get((ref_key, f)) for f in g]
+        if not all(ss):
+            return None
+        return {"kind": ss[0]["kind"], "start": min(x["start"] for x in ss), "end": max(x["end"] for x in ss)}
+    rsp = [run_span(r[ref_key]) for r in runs]
+
+    # ② 다른 소스 파일: 시간이 겹치는(가까운) 회차로
+    unknown, dropped = [], []
+    for f in O:
+        sf = spans.get((other, f))
+        if sf is None or not all(rsp):
+            unknown.append(f)
+            continue
+        best, best_score = None, None
+        for i, rs in enumerate(rsp):
+            (r0, r1), (f0, f1) = _span_cmp(rs, sf)
+            ov = min(r1, f1) - max(r0, f0)
+            score = ov if ov > 0 else -min(abs(f0 - r1), abs(r0 - f1))
+            if best_score is None or score > best_score:
+                best, best_score = i, score
+        if best is not None and best_score > -_SEG_GAP_S:
+            runs[best][other].append(f)
+        else:
+            dropped.append(f)
+    if unknown:
+        if len(runs) == 1:
+            runs[0][other] += unknown
+            if len(unknown) > 1:
+                notes.append(f"{other.upper()} 파일 시각을 읽지 못해 이름 순서로 이어 붙임: {', '.join(unknown)}")
+        else:
+            for i, f in enumerate(unknown):
+                if i < len(runs):
+                    runs[i][other].append(f)
+                else:
+                    dropped.append(f)
+            notes.append(f"{other.upper()} 파일 시각을 읽지 못해 i번째 {ref_key.upper()} 파일과 짝지음")
+    if dropped:
+        notes.append(f"⚠️ 시간이 겹치는 {ref_key.upper()} 파일이 없어 뺀 {other.upper()} 파일: {', '.join(dropped)}")
+    for r in runs:
+        r[other] = sorted(r[other], key=by_start(other))
+    return runs, notes
+
+
+def _plan_summary(runs: list, notes: list, mode: str) -> dict:
+    joined = [f"{k.upper()} {len(r[k])}개" for r in runs for k in ("br", "ams") if len(r.get(k, [])) > 1]
+    return {"n": len(runs), "mode": mode, "notes": notes,
+            "runs": [{"br": r.get("br", []), "ams": r.get("ams", [])} for r in runs],
+            "joined": joined}
+
+
+def _case_plan(case_dir: Path, cf: dict, mode: str = "auto", cfg: dict | None = None) -> dict:
+    cfg = cfg or DEFAULT_CFG
+    proc = cfg.get("processing", {})
+    _, rk = _ref_source(cf, proc.get("data_time", "BR"), proc.get("data_sources", ["BR", "AMS", "MX100"]))
+    runs, notes = _plan_runs(case_dir, cf, rk, cfg.get("file_rules"), mode)
+    return _plan_summary(runs, notes, mode)
+
+
 class CaseFilesReq(BaseModel):
     session_id: str
     case: str
     overrides: dict = {}
+    multi: str | None = None      # 여러 파일 처리: auto | concat | separate
 
 
 @app.post("/api/case-files")
@@ -1220,11 +1434,14 @@ def set_case_files(req: CaseFilesReq):
     ov = {ren.get(Path(str(k)).name, Path(str(k)).name): (v if v in _SRC_KEYS else None)
           for k, v in (req.overrides or {}).items()}
     s.setdefault("overrides", {})[req.case] = ov
+    if req.multi in ("auto", "concat", "separate"):
+        s.setdefault("multi", {})[req.case] = req.multi
     cf, um, entries = _case_entries(case_dir, DEFAULT_CFG.get("file_rules"),
                                     DEFAULT_CFG.get("processing", {}).get("data_sources"),
                                     ov, s.get("pairs", {}).get(req.case))
     s["case_files"][req.case] = cf
-    return {"case": req.case, "files": cf, "unmatched": um, "entries": entries}
+    plan = _case_plan(case_dir, cf, s.get("multi", {}).get(req.case, "auto"))
+    return {"case": req.case, "files": cf, "unmatched": um, "entries": entries, "plan": plan}
 
 
 class AmsLearnReq(BaseModel):
@@ -1282,23 +1499,24 @@ def select_cases(req: SelectRequest):
     category = Path(req.category_path)
     if not category.exists(): raise HTTPException(404, f"경로 없음: {req.category_path}")
     sid = str(uuid.uuid4())[:8]
-    case_files, unmatched, entries = {}, {}, {}
+    case_files, unmatched, entries, plans = {}, {}, {}, {}
     for case in req.case_names:
         case_dir = category / case
         if not case_dir.is_dir(): continue
         cf, um, ent = _case_entries(case_dir, DEFAULT_CFG.get("file_rules"),
                                     DEFAULT_CFG.get("processing",{}).get("data_sources"))
         case_files[case], entries[case] = cf, ent
+        plans[case] = _case_plan(case_dir, cf)
         if um:
             unmatched[case] = um
     if not case_files: raise HTTPException(400, "유효한 케이스 없음")
     sessions[sid] = {
         "status": "ready", "progress": 0, "log": [], "error": None,
         "category_path": str(category), "case_files": case_files,
-        "overrides": {}, "pairs": {},
+        "overrides": {}, "pairs": {}, "multi": {},
         "merge_results": [], "calc_results": [],
     }
-    return {"session_id": sid, "cases": case_files, "unmatched": unmatched, "files": entries}
+    return {"session_id": sid, "cases": case_files, "unmatched": unmatched, "files": entries, "plans": plans}
 
 
 def _peek_header(path: Path, skip_rows: int = 1) -> str:
@@ -1649,22 +1867,6 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 _log(sid, f"  ➕ Setting 기본 목록 밖 추가 변수 {len(extras)}개: "
                           f"{', '.join(extras[:12])}{' …' if len(extras) > 12 else ''}")
 
-        ref_map = {"BR":"br","AMS":"ams","MX100":"mx100","NIDAQ":"nidaq"}
-
-        def _plan_ref(cf):
-            """케이스별 실제 기준 시간축과 병합 횟수.
-            설정한 기준(dt) 소스의 파일이 그 케이스에 없으면 BR → AMS → MX100 → NIDAQ
-            순으로 파일이 있는 소스로 대체한다. (예전에는 0회 반복 → 'Merge 완료: 0개'로
-            아무 경고 없이 끝났다.) BR/AMS 는 파일 1개 = 시험 1회, 대체된 MX100/NIDAQ 는
-            여러 파일을 열 방향으로 합쳐 1회로 본다."""
-            rk = ref_map.get(dt, "br")
-            if dt in sources and cf.get(rk):
-                return dt, len(cf[rk])
-            for alt in ("BR", "AMS", "MX100", "NIDAQ"):
-                if alt in sources and cf.get(ref_map[alt]):
-                    return alt, (len(cf[ref_map[alt]]) if alt in ("BR", "AMS") else 1)
-            return None, 0
-
         # 1단계: 케이스별 파일 판별 + 병합 계획 (진행률 분모를 정확히 하기 위해 먼저 수행)
         plans = []
         for case_name in case_files:
@@ -1678,24 +1880,38 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 s.setdefault("renamed", {}).setdefault(case_name, {}).update(ren)
             cf = _case_entries(case_dir, cfg.get("file_rules"), sources, ov, pr)[0]
             s["case_files"][case_name] = cf
-            ref_eff, n = _plan_ref(cf)
+            ref_eff, ref_key = _ref_source(cf, dt, sources)
+            mode = s.get("multi", {}).get(case_name, "auto")
+            runs, pnotes = _plan_runs(case_dir, cf, ref_key, cfg.get("file_rules"), mode)
+            n = len(runs)
             found = ", ".join(f"{k.upper()} {len(v)}개" for k, v in cf.items() if v) or "없음"
             if n == 0:
                 _log(sid, f"  ⚠️ [{case_name}] 병합할 파일 없음 (판별된 파일: {found}) → 건너뜀")
             elif ref_eff != dt:
                 _log(sid, f"  ⚠️ [{case_name}] 기준 시간축 '{dt}' 파일 없음 → '{ref_eff}' 기준으로 병합 ({found})")
-            plans.append((case_name, case_dir, cf, ref_eff, n))
-        total = sum(p[4] for p in plans)
+            if n and (n > 1 or any(len(r.get(k, [])) > 1 for r in runs for k in ("br", "ams"))):
+                mtxt = {"auto": "자동(시간으로 판단)", "concat": "하나로 이어 붙이기", "separate": "파일마다 따로"}.get(mode, mode)
+                _log(sid, f"  🗂 [{case_name}] 병합 계획 {n}회 — 여러 파일: {mtxt}")
+                for i, r in enumerate(runs):
+                    _log(sid, f"     {i+1}회: " + " / ".join(
+                        f"{k.upper()} " + (" + ".join(r[k]) + (" (시간 순 이어 붙임)" if len(r[k]) > 1 else ""))
+                        for k in ("br", "ams") if r.get(k)))
+            for m in pnotes:
+                _log(sid, f"     {m}")
+            plans.append((case_name, case_dir, cf, ref_eff, runs))
+        total = sum(len(p[4]) for p in plans)
         done, results = 0, []
 
-        for case_name, case_dir, cf, ref_eff, n in plans:
-            for i in range(n):
+        for case_name, case_dir, cf, ref_eff, runs in plans:
+            n = len(runs)
+            for i, run in enumerate(runs):
                 t0 = time.perf_counter()
                 _log(sid, f"[{case_name}] {i+1}/{n} 병합 중...")
 
-                # 선택된 소스만 읽기 (MX100/NIDAQ는 전체 파일 리스트)
-                bp = str(case_dir / cf["br"][i]) if use_br and cf.get("br") and i < len(cf["br"]) else None
-                ap = str(case_dir / cf["ams"][i]) if use_ams and cf.get("ams") and i < len(cf["ams"]) else None
+                # 선택된 소스만 읽기 — BR·AMS 는 이 회차에 배정된 파일(여러 개면 시간 순 이어 붙임),
+                # MX100/NIDAQ 는 전체 파일 리스트
+                bp = [str(case_dir / f) for f in run.get("br", [])] if use_br else None
+                ap = [str(case_dir / f) for f in run.get("ams", [])] if use_ams else None
                 mp_list = [str(case_dir / f) for f in cf.get("mx100",[])] if use_mx and cf.get("mx100") else None
                 np_list = [str(case_dir / f) for f in cf.get("nidaq",[])] if use_ni and cf.get("nidaq") else None
 
@@ -2444,7 +2660,8 @@ def _prep_generic_time(df, label="NIDAQ"):
 def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
     """
     소스별 파일 읽기. mp_list/np_list는 리스트(여러 파일 → 컬럼 병합).
-    ap, bp는 단일 경로(문자열 또는 None).
+    ap, bp는 경로 하나 또는 리스트 — 여러 개면 같은 시험이 나뉜 조각으로 보고 순서대로 이어 붙임
+    (병합 계획이 시간 순으로 정렬해서 넘김).
     """
     df_a, df_b, df_m, df_n = pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     fr = file_rules or {}
@@ -2493,10 +2710,33 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
                         merged[c] = df[c].values[:len(merged)] if len(df) >= len(merged) else np.nan
         return merged
 
-    if bp and os.path.exists(bp):
-        df_b = _read_csv(bp, "br", 1)
-    if ap and os.path.exists(ap):
-        df_a = _read_csv(ap, "ams", 1)
+    def _read_parts(paths, src_key, label):
+        paths = [p_ for p_ in ([paths] if isinstance(paths, str) else (paths or [])) if p_ and os.path.exists(p_)]
+        parts = []
+        for p_ in paths:
+            d = _read_csv(p_, src_key, 1)
+            if d is not None and not d.empty:
+                parts.append((p_, d))
+        if not parts:
+            return pd.DataFrame()
+        if len(parts) == 1:
+            return parts[0][1]
+        if src_key == "ams" and all("Time" in d.columns for _, d in parts):
+            # 조각마다 시각 표기가 다르면(.dat 는 날짜 포함, CSV 는 시:분:초 등) 하루 중 시각으로 맞춤
+            kinds = {ams_dat.csv_time_seconds(d["Time"].head(50))[1] for _, d in parts}
+            if len(kinds) > 1:
+                for _, d in parts:
+                    sec, _k, _b = ams_dat.csv_time_seconds(d["Time"])
+                    tod = np.mod(sec, 86400.0)
+                    d["Time"] = [f"{int(x // 3600):02d}:{int(x % 3600 // 60):02d}:{x % 60:06.3f}" if np.isfinite(x) else None
+                                 for x in tod]
+                print(f"  [{label}] 조각마다 시각 표기가 달라 하루 중 시각(HH:MM:SS.fff)으로 맞춤: {sorted(kinds)}")
+        print(f"  [{label}] 파일 {len(parts)}개 이어 붙임: " + " + ".join(
+            f"{os.path.basename(p_)}({len(d):,}행)" for p_, d in parts))
+        return pd.concat([d for _, d in parts], ignore_index=True, sort=False)
+
+    df_b = _read_parts(bp, "br", "BR")
+    df_a = _read_parts(ap, "ams", "AMS")
 
     # MX100: 여러 파일 → 컬럼 병합
     if mp_list:

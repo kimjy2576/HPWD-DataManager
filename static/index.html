@@ -93,15 +93,16 @@ const[files,setFiles]=useState({});      // 케이스별 파일 목록 [{file,si
 const[ovr,setOvr]=useState({});          // 화면에서 고른 것 {케이스:{파일:소스|null}}
 const[openC,setOpenC]=useState(new Set());
 const[lrn,setLrn]=useState({});          // AMS .dat 형식 학습 {케이스/파일:{csv,path,busy,res}}
+const[plans,setPlans]=useState({});      // 케이스별 병합 계획 {n, mode, runs:[{br,ams}], joined, notes}
 const browse=async()=>{setBusy(true);try{const r=await fetch(`${API}/api/browse`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const d=await r.json();if(!r.ok){alert(d.detail);setBusy(false);return}setCases(d.cases||[]);setPath(d.path);localStorage.setItem('dryer_path',d.path);setSel(new Set(d.cases||[]))}catch(e){alert(e.message)}setBusy(false)};
-const confirm=async()=>{if(!sel.size){alert('선택 없음');return}try{const r=await fetch(`${API}/api/select`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category_path:path,case_names:[...sel]})});const d=await r.json();if(!r.ok){alert(d.detail);return}setSid(d.session_id);setCf(d.cases||{});setUnm(d.unmatched||{});setFiles(d.files||{});setOvr({});setLrn({});
+const confirm=async()=>{if(!sel.size){alert('선택 없음');return}try{const r=await fetch(`${API}/api/select`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category_path:path,case_names:[...sel]})});const d=await r.json();if(!r.ok){alert(d.detail);return}setSid(d.session_id);setCf(d.cases||{});setUnm(d.unmatched||{});setFiles(d.files||{});setOvr({});setLrn({});setPlans(d.plans||{});
   setOpenC(new Set(Object.entries(d.files||{}).filter(([c,l])=>Object.values(d.cases?.[c]||{}).some(v=>v.length>1)||l.some(e=>e.learn)).map(([c])=>c).slice(0,3)));setSt({status:'ready',progress:0,log:[],merge_results:[],calc_results:[]});if(onSessionReady)onSessionReady(d.session_id,d.cases)}catch(e){alert(e.message)}};
 const tog=n=>{setSel(p=>{const s=new Set(p);s.has(n)?s.delete(n):s.add(n);return s})};
 // 파일 선택 저장 → 서버가 다시 판별해 소스별 목록·미분류·파일 목록을 돌려줌 (변수 스캔·Merge 가 이대로 사용)
-const applyCase=async(c,next)=>{setOvr(p=>({...p,[c]:next}));
-  try{const r=await fetch(`${API}/api/case-files`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,case:c,overrides:next})});
+const applyCase=async(c,next,multi)=>{setOvr(p=>({...p,[c]:next}));
+  try{const r=await fetch(`${API}/api/case-files`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,case:c,overrides:next,...(multi?{multi}:{})})});
   const d=await r.json();if(!r.ok){alert(d.detail);return}
-  setCf(p=>({...p,[c]:d.files}));setFiles(p=>({...p,[c]:d.entries}));
+  setCf(p=>({...p,[c]:d.files}));setFiles(p=>({...p,[c]:d.entries}));if(d.plan)setPlans(p=>({...p,[c]:d.plan}));
   setUnm(p=>{const q={...p};if(d.unmatched?.length)q[c]=d.unmatched;else delete q[c];return q})}catch(e){alert(e.message)}};
 const guessSrc=e=>e.auto||(e.learn?'ams':/\.(xls|xlsx|xlsm)$/i.test(e.file)?'mx100':/\.csv$/i.test(e.file)?'br':'nidaq');
 const setFileSrc=(c,e,src)=>{const cur={...(ovr[c]||{})};if((src||null)===(e.dflt||null))delete cur[e.file];else cur[e.file]=src||null;
@@ -134,11 +135,24 @@ return(<div className="cd"><div className="ct">데이터 경로</div>
 return<div key={c}>
 <div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0',fontSize:12}}><span style={{color:'var(--tx2)',minWidth:200}}>{c}</span><div style={{display:'flex',gap:4,alignItems:'center'}}>{f.br?.length>0&&<span className="ft fb" title={f.br.join('\n')}>BR×{f.br.length}</span>}{f.ams?.length>0&&<span className="ft fa" title={f.ams.join('\n')}>AMS×{f.ams.length}</span>}{f.mx100?.length>0&&<span className="ft fm" title={f.mx100.join('\n')}>MX×{f.mx100.length}</span>}{f.nidaq?.length>0&&<span title={f.nidaq.join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>NIDAQ×{f.nidaq.length}</span>}{unm[c]?.length>0&&<span title={unm[c].map(u=>`${u.file} — ${u.why}`).join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(234,179,8,.14)',color:'#b45309',cursor:'help'}}>미분류×{unm[c].length}</span>}
   {fl.length>0&&<button className="bt bs" style={{fontSize:10,padding:'1px 8px',marginLeft:6}} onClick={()=>setOpenC(p=>{const q=new Set(p);q.has(c)?q.delete(c):q.add(c);return q})} title="이 케이스에서 쓸 파일과 소스를 고릅니다">파일 선택 {op?'▴':'▾'}</button>}
-  {multi&&<span style={{fontSize:10,color:'#b45309'}}>같은 소스 파일 여러 개 — BR·AMS 는 i번째 파일끼리 짝지어 병합</span>}
+  {plans[c]&&(plans[c].n!==1||plans[c].joined?.length>0||multi)&&<span style={{fontSize:10,color:plans[c].n===0?'#dc2626':'var(--blue)'}} title={(plans[c].runs||[]).map((r,i)=>`${i+1}회: `+['br','ams'].filter(k=>r[k]?.length).map(k=>`${k.toUpperCase()} ${r[k].join(' + ')}`).join(' / ')).join('\n')}>→ 병합 {plans[c].n}회{plans[c].joined?.length>0?` · ${plans[c].joined.join(', ')} 이어 붙임`:''}</span>}
   {nLearn>0&&!op&&<span style={{fontSize:10,color:'#b45309'}}>.dat {nLearn}개 형식 학습 필요</span>}
-  {Object.keys(ovr[c]||{}).length>0&&<span style={{fontSize:10,color:'var(--ac)'}}>직접 고름 {Object.keys(ovr[c]).length}개</span>}
+  {Object.keys(ovr[c]||{}).length>0&&<span style={{fontSize:10,color:'var(--blue)'}}>직접 고름 {Object.keys(ovr[c]).length}개</span>}
 </div></div>
 {op&&<div style={{margin:'2px 0 8px 12px',padding:'6px 10px',borderLeft:'2px solid var(--bd)',fontSize:11}}>
+  {(f.br?.length>1||f.ams?.length>1)&&plans[c]&&<div style={{marginBottom:6,padding:'4px 8px',borderRadius:4,background:'var(--bg2)'}}>
+    <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
+      <b>같은 소스 파일이 여러 개</b>
+      <select value={plans[c].mode||'auto'} onChange={ev=>applyCase(c,ovr[c]||{},ev.target.value)} style={{fontSize:10,padding:'1px 4px'}}>
+        <option value="auto">자동 — 시간이 이어지면 이어 붙이고, 겹치는 파일끼리 짝</option>
+        <option value="concat">전부 하나로 이어 붙여 1회 병합</option>
+        <option value="separate">파일마다 따로 (i번째 BR·AMS 끼리 짝)</option>
+      </select>
+      <span style={{color:'var(--tx2)'}}>→ 병합 {plans[c].n}회</span>
+    </div>
+    {(plans[c].runs||[]).map((r,i)=><div key={i} style={{color:'var(--tx2)',fontFamily:'var(--mono)',fontSize:10}}>{i+1}회: {['br','ams'].filter(k=>r[k]?.length).map(k=>`${k.toUpperCase()} ${r[k].join(' + ')}`).join('  /  ')||'(파일 없음)'}</div>)}
+    {(plans[c].notes||[]).map((m,i)=><div key={'n'+i} style={{color:'#b45309'}}>{m}</div>)}
+  </div>}
   {fl.map(e=>{const k=c+'/'+e.file;const L=lrn[k]||{};const pick=L.csv??(e.csvs?.[0]||'__path');
   return<div key={e.file} style={{padding:'2px 0'}}>
     <div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap'}}>
