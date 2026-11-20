@@ -104,7 +104,11 @@ const applyCase=async(c,next,multi)=>{setOvr(p=>({...p,[c]:next}));
   const d=await r.json();if(!r.ok){alert(d.detail);return}
   setCf(p=>({...p,[c]:d.files}));setFiles(p=>({...p,[c]:d.entries}));if(d.plan)setPlans(p=>({...p,[c]:d.plan}));
   setUnm(p=>{const q={...p};if(d.unmatched?.length)q[c]=d.unmatched;else delete q[c];return q})}catch(e){alert(e.message)}};
-const guessSrc=e=>e.auto||(e.learn?'ams':/\.(xls|xlsx|xlsm)$/i.test(e.file)?'mx100':/\.csv$/i.test(e.file)?'br':'nidaq');
+// 파일명에 AMS 가 단어로 있으면 AMS (서버 io_handler.ams_by_name 과 같은 규칙)
+const amsByName=f=>/\.(csv|tsv|txt|dat)$/i.test(f)&&/(^|[^A-Za-z])[Aa][Mm][Ss]|[a-z]AMS/.test(f.replace(/\.[^.]+$/,''));
+// 병합 회차 설명 — AMS 동시 기록 묶음은 ‖ 로 (나란히 병합), 조각은 + 로 (이어 붙임)
+const runDesc=(r,k)=>k==='ams'&&(r.ams_streams||[]).length>1?`AMS ${r.ams_streams.map(g=>g.join(' + ')).join('  ‖  ')} (동시 기록 → 나란히)`:`${k.toUpperCase()} ${r[k].join(' + ')}`;
+const guessSrc=e=>e.auto||(e.learn||amsByName(e.file)?'ams':/\.(xls|xlsx|xlsm)$/i.test(e.file)?'mx100':/\.csv$/i.test(e.file)?'br':'nidaq');
 const setFileSrc=(c,e,src)=>{const cur={...(ovr[c]||{})};if((src||null)===(e.dflt||null))delete cur[e.file];else cur[e.file]=src||null;
   setFiles(p=>({...p,[c]:(p[c]||[]).map(x=>x.file===e.file?{...x,src:src||null}:x)}));   // 바로 반영 (서버 응답으로 다시 맞춤)
   applyCase(c,cur)};
@@ -135,7 +139,7 @@ return(<div className="cd"><div className="ct">데이터 경로</div>
 return<div key={c}>
 <div style={{display:'flex',alignItems:'center',gap:8,padding:'4px 0',fontSize:12}}><span style={{color:'var(--tx2)',minWidth:200}}>{c}</span><div style={{display:'flex',gap:4,alignItems:'center'}}>{f.br?.length>0&&<span className="ft fb" title={f.br.join('\n')}>BR×{f.br.length}</span>}{f.ams?.length>0&&<span className="ft fa" title={f.ams.join('\n')}>AMS×{f.ams.length}</span>}{f.mx100?.length>0&&<span className="ft fm" title={f.mx100.join('\n')}>MX×{f.mx100.length}</span>}{f.nidaq?.length>0&&<span title={f.nidaq.join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(168,85,247,.1)',color:'#a855f7'}}>NIDAQ×{f.nidaq.length}</span>}{unm[c]?.length>0&&<span title={unm[c].map(u=>`${u.file} — ${u.why}`).join('\n')} style={{fontSize:9,padding:'1px 6px',borderRadius:4,background:'rgba(234,179,8,.14)',color:'#b45309',cursor:'help'}}>미분류×{unm[c].length}</span>}
   {fl.length>0&&<button className="bt bs" style={{fontSize:10,padding:'1px 8px',marginLeft:6}} onClick={()=>setOpenC(p=>{const q=new Set(p);q.has(c)?q.delete(c):q.add(c);return q})} title="이 케이스에서 쓸 파일과 소스를 고릅니다">파일 선택 {op?'▴':'▾'}</button>}
-  {plans[c]&&(plans[c].n!==1||plans[c].joined?.length>0||multi)&&<span style={{fontSize:10,color:plans[c].n===0?'#dc2626':'var(--blue)'}} title={(plans[c].runs||[]).map((r,i)=>`${i+1}회: `+['br','ams'].filter(k=>r[k]?.length).map(k=>`${k.toUpperCase()} ${r[k].join(' + ')}`).join(' / ')).join('\n')}>→ 병합 {plans[c].n}회{plans[c].joined?.length>0?` · ${plans[c].joined.join(', ')} 이어 붙임`:''}</span>}
+  {plans[c]&&(plans[c].n!==1||plans[c].joined?.length>0||multi)&&<span style={{fontSize:10,color:plans[c].n===0?'#dc2626':'var(--blue)'}} title={(plans[c].runs||[]).map((r,i)=>`${i+1}회: `+['br','ams'].filter(k=>r[k]?.length).map(k=>runDesc(r,k)).join(' / ')).join('\n')}>→ 병합 {plans[c].n}회{plans[c].joined?.length>0?` · ${plans[c].joined.join(', ')}`:''}</span>}
   {nLearn>0&&!op&&<span style={{fontSize:10,color:'#b45309'}}>.dat {nLearn}개 형식 학습 필요</span>}
   {Object.keys(ovr[c]||{}).length>0&&<span style={{fontSize:10,color:'var(--blue)'}}>직접 고름 {Object.keys(ovr[c]).length}개</span>}
 </div></div>
@@ -150,7 +154,7 @@ return<div key={c}>
       </select>
       <span style={{color:'var(--tx2)'}}>→ 병합 {plans[c].n}회</span>
     </div>
-    {(plans[c].runs||[]).map((r,i)=><div key={i} style={{color:'var(--tx2)',fontFamily:'var(--mono)',fontSize:10}}>{i+1}회: {['br','ams'].filter(k=>r[k]?.length).map(k=>`${k.toUpperCase()} ${r[k].join(' + ')}`).join('  /  ')||'(파일 없음)'}</div>)}
+    {(plans[c].runs||[]).map((r,i)=><div key={i} style={{color:'var(--tx2)',fontFamily:'var(--mono)',fontSize:10}}>{i+1}회: {['br','ams'].filter(k=>r[k]?.length).map(k=>runDesc(r,k)).join('  /  ')||'(파일 없음)'}</div>)}
     {(plans[c].notes||[]).map((m,i)=><div key={'n'+i} style={{color:'#b45309'}}>{m}</div>)}
   </div>}
   {fl.map(e=>{const k=c+'/'+e.file;const L=lrn[k]||{};const pick=L.csv??(e.csvs?.[0]||'__path');
@@ -164,6 +168,7 @@ return<div key={c}>
       <span style={{color:'var(--tx3)'}}>{fmtB(e.size)}</span>
       {e.auto&&e.src&&e.auto!==e.src&&<span style={{color:'var(--tx3)'}}>(자동 판별: {e.auto.toUpperCase()})</span>}
       {e.why&&!e.src&&<span style={{color:'#b45309'}}>{e.why}</span>}
+      {e.warn&&e.src&&<span style={{color:'#b45309'}}>⚠️ {e.warn}</span>}
     </div>
     {e.learn&&<div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',margin:'3px 0 4px 22px'}}>
       <span style={{color:'var(--tx2)'}}>AMS .dat 형식 학습 — 같은 측정을 AMS 에서 내보낸 CSV:</span>
@@ -374,7 +379,9 @@ return(<>
 // ═══ Merge 탭 ═══
 function MergeTab({cfg,sid,setSid,st,setSt,setTab,setCalcAutoFiles,setViewerAutoLoad}){
 const[poll,setPoll]=useState(false);const pr=useRef();
-const[varCols,setVarCols]=useState(null);  // 스캔된 컬럼 {col: {source,dtype}}
+const[varCols,setVarCols]=useState(null);  // 스캔된 컬럼 {col: {source,dtype,files}}
+const[scanInfo,setScanInfo]=useState(null); // 스캔한 파일 {files:[{case,file,src,cols,error}], cases, cases_total}
+const[varFile,setVarFile]=useState('');     // 파일로 거르기 ('' = 전체)
 const[varSet,setVarSet]=useState({});       // 변수 설정 {col: {include,weight,bias}}
 const[varDefs,setVarDefs]=useState({});     // 스캔 기본값 {col:{weight,bias,rename}} — '리셋' 복원용
 const[varOpen,setVarOpen]=useState(false);  // 패널 접기/펼치기
@@ -385,7 +392,7 @@ const[scanning,setScanning]=useState(false);
 const scanVars=async()=>{if(!sid)return;setScanning(true);
   try{const r=await fetch(`${API}/api/scan-columns`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:sid})});
   const d=await r.json();if(!r.ok){alert(d.detail);setScanning(false);return}
-  setVarCols(d.columns);
+  setVarCols(d.columns);setScanInfo({files:d.files||[],cases:d.cases,cases_total:d.cases_total});setVarFile('');
   const csvCols=Object.keys(d.columns);
   // 기본 설정: 전부 include=false로 시작
   const init={};csvCols.forEach(c=>{init[c]={include:false,weight:1.0,bias:0.0,rename:''}});
@@ -490,9 +497,14 @@ const runMerge=async()=>{if(!sid)return;
 
 useEffect(()=>{if(!poll||!sid)return;const id=setInterval(async()=>{try{const r=await fetch(`${API}/api/status/${sid}`);const d=await r.json();setSt(d);if(d.status==='done'||d.status==='error')setPoll(false)}catch(e){console.error(e)}},800);pr.current=id;return()=>clearInterval(id)},[poll,sid]);
 
-// 필터링된 변수 목록
-const filteredVars=varCols?Object.entries(varCols).filter(([c])=>
-  !varFilter||c.toLowerCase().includes(varFilter.toLowerCase())):[];
+// 필터링된 변수 목록 (검색어 + 파일)
+const filteredVars=varCols?Object.entries(varCols).filter(([c,info])=>
+  (!varFilter||c.toLowerCase().includes(varFilter.toLowerCase()))&&(!varFile||(info.files||[]).includes(varFile))):[];
+// 스캔한 파일 정리 — 소스별 (읽은) 파일 이름, 못 읽은 파일
+const scanOk=(scanInfo?.files||[]).filter(f=>!f.error&&f.file);
+const scanBad=(scanInfo?.files||[]).filter(f=>f.error);
+const srcFiles={},srcCount={};scanOk.forEach(f=>{(srcFiles[f.src]=srcFiles[f.src]||new Set()).add(f.file);srcCount[f.src]=(srcCount[f.src]||0)+1});
+const fileNames=[...new Set(scanOk.map(f=>f.file))];
 
 const includedCount=Object.values(varSet).filter(v=>v.include).length;
 // 스캔 기본값(AMS 자동 배율 포함)과 다른 것만 사용자 W&B·이름 변경으로 셈
@@ -514,9 +526,27 @@ return(<div>
     </div>
 
     {varOpen&&varCols&&<div style={{marginTop:14}}>
+      {/* 스캔한 파일 — 선택한 모든 케이스·파일 (못 읽은 파일은 이유와 함께) */}
+      {scanInfo&&<div style={{marginBottom:10,fontSize:11,color:'var(--tx2)'}}>
+        <div>📄 스캔: 케이스 {scanInfo.cases}개{scanInfo.cases_total>scanInfo.cases&&<span style={{color:'#b45309'}}> (전체 {scanInfo.cases_total}개 중 — 오래 걸려 일부만)</span>} · 파일 {scanOk.length}개{Object.keys(srcCount).length>0&&` (${Object.entries(srcCount).map(([k,v])=>`${k} ${v}`).join(' · ')})`} → 변수 {Object.keys(varCols).length}개</div>
+        {scanBad.length>0&&<div style={{marginTop:4,padding:'6px 8px',borderRadius:6,background:'rgba(245,158,11,.08)',border:'1px solid rgba(245,158,11,.3)',color:'#b45309'}}>
+          ⚠️ 읽지 못한 파일 {scanBad.length}개 — 이 파일의 변수는 목록에 없고 Merge 에서도 빠집니다
+          {scanBad.map((f,i)=><div key={i} style={{fontFamily:'var(--mono)',fontSize:10,marginTop:2,wordBreak:'break-all'}}>· {f.case}{f.file?' / '+f.file:''}{f.src?` (${f.src})`:''}: {f.error}</div>)}
+        </div>}
+        {(scanInfo.files||[]).length>1&&<details style={{marginTop:4}}>
+          <summary style={{cursor:'pointer',color:'var(--tx3)',fontSize:10}}>파일별 보기</summary>
+          <div style={{maxHeight:140,overflowY:'auto',marginTop:4,fontFamily:'var(--mono)',fontSize:10,lineHeight:1.6}}>
+            {scanInfo.files.map((f,i)=><div key={i} style={{color:f.error?'#b45309':'var(--tx2)'}}>{f.case} / {f.file||'-'} · {f.src||'-'} · {f.error?'못 읽음':`변수 ${f.cols}개`}</div>)}
+          </div>
+        </details>}
+      </div>}
       {/* 툴바 */}
       <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:10,flexWrap:'wrap'}}>
         <input value={varFilter} onChange={e=>setVarFilter(e.target.value)} placeholder="변수명 검색..." style={{width:200,fontSize:12}}/>
+        {fileNames.length>1&&<select value={varFile} onChange={e=>setVarFile(e.target.value)} style={{fontSize:11,padding:'3px 6px',maxWidth:240}} title="이 파일에 있는 변수만 보기">
+          <option value="">파일: 전체 ({fileNames.length}개)</option>
+          {fileNames.map(f=><option key={f} value={f}>{f}</option>)}
+        </select>}
         <button className="bt bs" onClick={selectAll}>전체 선택</button>
         <button className="bt bs" onClick={deselectAll}>전체 해제</button>
         <span className="it">{filteredVars.length}개 표시</span>
@@ -534,7 +564,7 @@ return(<div>
       {/* 변수 테이블 */}
       <div style={{border:'1px solid var(--bd)',borderRadius:8,overflow:'hidden'}}>
         {/* 헤더 */}
-        <div style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 60px 70px 70px 70px',gap:0,padding:'8px 12px',background:'var(--bg3)',fontSize:11,color:'var(--tx2)',fontWeight:500}}>
+        <div style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 96px 70px 70px 70px',gap:0,padding:'8px 12px',background:'var(--bg3)',fontSize:11,color:'var(--tx2)',fontWeight:500}}>
           <span></span><span>원본 변수명</span><span>변경 이름</span><span>소스</span><span style={{textAlign:'center'}}>Weight</span><span style={{textAlign:'center'}}>Bias</span><span></span>
         </div>
         {/* 항목 — 전부 표시 (예전엔 300개까지만 그려서 AMS+BR 컬럼이 많으면 뒤쪽 변수가 안 보였음) */}
@@ -551,12 +581,15 @@ return(<div>
               ?'로거 배율 표기가 없는 컬럼 — Merge 때 데이터로 배율을 자동 판정합니다.\nWeight를 바꾸면 자동 판정 대신 원본 × Weight 로 고정됩니다.'
               :`로거 배율 ×${info.auto_scale} 가 자동 적용됩니다 (Setting → AMS 배율).\nWeight를 바꾸면 원본 × Weight 로 적용됩니다 (이중 적용 안 됨).`;
             const dim=vs.include?1:.45;
-            return(<div key={col} style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 60px 70px 70px 70px',gap:0,padding:'5px 12px',borderTop:'1px solid var(--bd)',alignItems:'center',fontSize:12}}>
+            // 같은 소스 파일이 여럿인데 일부 파일에만 있는 변수 → 어느 파일 것인지 표시
+            const part=(info.files||[]).length>0&&srcFiles[info.source]&&info.files.length<srcFiles[info.source].size;
+            return(<div key={col} style={{display:'grid',gridTemplateColumns:'32px 1fr 1fr 96px 70px 70px 70px',gap:0,padding:'5px 12px',borderTop:'1px solid var(--bd)',alignItems:'center',fontSize:12}}>
               <input type="checkbox" checked={!!vs.include} onChange={e=>setVar(col,'include',e.target.checked)} style={{accentColor:'var(--teal)'}}/>
               <span style={{fontFamily:'var(--mono)',fontSize:11,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:hasRename?'var(--tx3)':'var(--tx)',opacity:dim,cursor:'pointer'}} title={col+(vs.include?'':'\n(클릭하면 체크)')} onClick={()=>!vs.include&&setVar(col,'include',true)}>{col}</span>
               <input type="text" value={vs.rename||''} onChange={e=>editVar(col,'rename',e.target.value)} placeholder={info.std||col} title="입력하면 자동으로 체크됩니다" style={{fontSize:11,padding:'3px 6px',background:hasRename?'rgba(59,130,246,.08)':'var(--bg)',borderColor:hasRename?'rgba(59,130,246,.3)':'var(--bd2)',fontFamily:'var(--mono)',opacity:vs.include?1:.7}}/>
               <span style={{display:'flex',flexDirection:'column',alignItems:'flex-start',gap:1,opacity:dim}}>
-                <span className={`ft ${info.source==='BR'?'fb':info.source==='AMS'?'fa':'fm'}`}>{info.source}</span>
+                <span className={`ft ${info.source==='BR'?'fb':info.source==='AMS'?'fa':'fm'}`} title={(info.files||[]).length?'이 변수가 있는 파일:\n'+info.files.join('\n'):''}>{info.source}</span>
+                {part&&<span title={'이 변수가 있는 파일:\n'+info.files.join('\n')} style={{fontSize:9,color:'var(--tx3)',maxWidth:'100%',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',cursor:'help'}}>{info.files.map(f=>f.replace(/\.[^.]+$/,'')).join(', ')}</span>}
                 {auto&&<span title={autoTip} style={{fontSize:9,color:'var(--teal)',cursor:'help',whiteSpace:'nowrap'}}>{info.auto_mode==='infer'?'자동 판정':`자동 ×${info.auto_scale}`}</span>}
               </span>
               <input type="text" inputMode="decimal" value={vs.weight??''} onChange={e=>editVar(col,'weight',e.target.value)} title={autoTip||'출력 = 원본 × Weight + Bias'} style={{width:60,fontSize:11,padding:'3px 5px',textAlign:'center',background:isModified?'rgba(20,184,166,.08)':'var(--bg)',opacity:vs.include?1:.7}}/>

@@ -5,6 +5,7 @@ import os, sys, uuid, time, traceback, re, csv
 from collections import Counter
 from pathlib import Path
 import ams_dat
+from io_handler import ams_by_name
 from typing import Optional
 
 import yaml
@@ -1200,7 +1201,18 @@ def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
              "dflt": dflt.get(x.name), "src": eff.get(x.name), "why": why.get(x.name, "")}
         if not e["auto"] and not e["why"]:
             e["why"] = "자동 판별 대상 아님 — 쓰려면 체크하고 소스를 고르세요"
-        if nl.endswith(".dat") and kind in ("binary", "excel") and e["auto"] != "ams":
+        no_spec = False
+        if kind == "binary" and nl.endswith(".dat") and (e["auto"] == "ams" or e["src"] == "ams"):
+            # 파일명으로 AMS 가 됐거나 직접 AMS 로 고른 바이너리 .dat — 맞는 학습 형식이 없으면 아직 못 읽음
+            try:
+                no_spec = ams_dat.find_spec(str(x), head=ams_dat.read_bytes(str(x), 2 << 20),
+                                            size=e["size"])[0] is None
+            except Exception:
+                no_spec = True
+            if no_spec:
+                e["warn"] = ("바이너리 .dat 인데 맞는 학습 형식이 없어 아직 읽을 수 없음 — 아래에서 같은 측정을 "
+                             "AMS 에서 내보낸 CSV 를 골라 [형식 학습] 하세요 (안 하면 병합에서 빠짐)")
+        if nl.endswith(".dat") and kind in ("binary", "excel") and (e["auto"] != "ams" or no_spec):
             e["learn"] = True
             k0 = _stem_key(x.name)
             e["csvs"] = sorted(csvs, key=lambda c: (_stem_key(c) != k0, auto.get(c) != "ams", c))
@@ -1315,6 +1327,79 @@ def _span_cmp(a: dict, b: dict):
     return tod(a), tod(b)
 
 
+# ── 같은 시험을 동시에 기록한 AMS 파일 (다른 로거·보드) ──
+# 시간이 겹치는데 열 구성이 다르면 조각이 아니라 나란히 놓을 파일 → 각각 전처리해서 1초 시간축에서 병합
+_AMS_KEY_COLS = frozenset({"time", "packet index", "packetindex", "index", "no", "no.", "date", "datetime"})
+_COLS_CACHE: dict = {}
+
+
+def _file_head_cols(path: Path, src: str, file_rules: dict | None) -> frozenset:
+    """파일의 열 이름 (시각·번호 열 제외, 소문자) — 동시 기록 판정용. 못 읽으면 빈 집합."""
+    path = Path(path)
+    try:
+        stt = path.stat()
+    except OSError:
+        return frozenset()
+    key = (str(path), src, stt.st_mtime, stt.st_size)
+    if key in _COLS_CACHE:
+        return _COLS_CACHE[key]
+    cols = frozenset()
+    n0 = len(_READ_NOTES)
+    try:
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            head = read_source_csv(str(path), file_rules or {}, src, 1, nrows=5)
+        if head is not None:
+            cols = frozenset(str(c).strip().lower() for c in head.columns) - _AMS_KEY_COLS
+    except Exception:
+        pass
+    del _READ_NOTES[n0:]
+    _COLS_CACHE[key] = cols
+    return cols
+
+
+def _distinct_cols(a, b) -> bool:
+    """열 구성이 다른 로거·보드 수준으로 다른가 — 공통 열이 적은 쪽 열 수의 절반 미만."""
+    if not a or not b:
+        return False
+    return len(a & b) < 0.5 * min(len(a), len(b))
+
+
+def _overlap_s(a: dict, b: dict) -> float:
+    (a0, a1), (b0, b1) = _span_cmp(a, b)
+    return min(a1, b1) - max(a0, b0)
+
+
+def _ams_stream_groups(case_dir: Path, files: list, file_rules: dict | None) -> list:
+    """한 회차의 AMS 파일 → 묶음 [[파일, …], …].
+    · 시간이 이어지는 조각(로그가 여러 파일로 나뉜 것) → 한 묶음, 시간 순으로 이어 붙임
+    · 시간이 겹치는데 열 구성이 다른 파일(같은 시험을 동시에 기록한 다른 로거·보드) → 다른 묶음,
+      각각 전처리해서 1초 시간축에서 나란히 병합 (예전엔 이어 붙여서 겹치는 시각의 두 번째 파일 값이 빠졌음)"""
+    files = list(files or [])
+    if len(files) <= 1:
+        return [files] if files else []
+    info = [(f, _file_span(case_dir / f, "ams", file_rules), _file_head_cols(case_dir / f, "ams", file_rules))
+            for f in files]
+    info.sort(key=lambda x: (x[1] is None, (x[1] or {}).get("start", 0.0), x[0]))
+    streams = []
+    for f, sp, cols in info:
+        best = None
+        for s in streams:
+            # 이 묶음에 시간이 겹치면서(시각을 모르면 겹친다고 봄) 열 구성이 다른 파일이 있으면 → 나란히
+            if any(_distinct_cols(c2, cols) and (sp is None or s2 is None or _overlap_s(s2, sp) > 60)
+                   for _, s2, c2 in s):
+                continue
+            allc = frozenset().union(*(c2 for _, _, c2 in s))
+            sim = len(allc & cols) / max(1, len(allc | cols))
+            if best is None or sim > best[0]:
+                best = (sim, s)
+        if best is not None:
+            best[1].append((f, sp, cols))
+        else:
+            streams.append([(f, sp, cols)])
+    return [[f for f, _, _ in s] for s in streams]
+
+
 def _ref_source(cf: dict, dt: str, sources: list):
     """기준 시간축 소스 (설정한 기준 소스 파일이 없으면 BR → AMS → MX100 → NIDAQ 순으로 대체)."""
     ref_map = {"BR": "br", "AMS": "ams", "MX100": "mx100", "NIDAQ": "nidaq"}
@@ -1340,19 +1425,39 @@ def _plan_runs(case_dir: Path, cf: dict, ref_key: str | None, file_rules: dict |
     spans = {(k, f): _file_span(case_dir / f, k, file_rules) for k, lst in ((ref_key, R), (other, O)) for f in lst}
     by_start = lambda k: (lambda f: (spans.get((k, f)) is None, (spans.get((k, f)) or {}).get("start", 0), f))
 
+    def with_streams(runs):
+        # AMS 파일이 여럿인 회차: 이어 붙일 조각 / 나란히 놓을 동시 기록 파일 나누기
+        for r in runs:
+            r["ams_streams"] = _ams_stream_groups(case_dir, r.get("ams", []), file_rules)
+            if len(r["ams_streams"]) > 1:
+                notes.append("AMS " + " ‖ ".join(" + ".join(s) for s in r["ams_streams"])
+                             + " — 시간이 겹치고 열 구성이 달라 동시에 기록한 파일로 보고 나란히 병합")
+        return runs, notes
+
     if mode == "separate":
-        return [{ref_key: [f], other: [O[i]] if i < len(O) else []} for i, f in enumerate(R)], notes
+        return with_streams([{ref_key: [f], other: [O[i]] if i < len(O) else []} for i, f in enumerate(R)])
     if mode == "concat":
-        return [{ref_key: sorted(R, key=by_start(ref_key)), other: sorted(O, key=by_start(other))}], notes
+        return with_streams([{ref_key: sorted(R, key=by_start(ref_key)), other: sorted(O, key=by_start(other))}])
 
     # ① 기준 파일: 시간이 이어지면 한 회차로
+    #    (AMS 가 기준일 때 시간이 겹치는데 열 구성이 다른 파일 = 동시에 기록한 다른 로거 → 같은 회차)
     if R and all(spans.get((ref_key, f)) for f in R):
         Rs = sorted(R, key=by_start(ref_key))
         groups = [[Rs[0]]]
         for f in Rs[1:]:
-            prev, cur = _span_cmp(spans[(ref_key, groups[-1][-1])], spans[(ref_key, f)])
-            gap = cur[0] - prev[1]
-            if -60 <= gap <= _SEG_GAP_S:
+            sf = spans[(ref_key, f)]
+            gaps = {}
+            for g in groups[-1]:
+                prev, cur = _span_cmp(spans[(ref_key, g)], sf)
+                gaps[g] = cur[0] - prev[1]
+            gap = min(gaps.values())
+            same = -60 <= gap <= _SEG_GAP_S
+            if not same and gap < -60 and ref_key == "ams":
+                cols_f = _file_head_cols(case_dir / f, "ams", file_rules)
+                ov = [g for g in groups[-1] if _overlap_s(spans[(ref_key, g)], sf) > 60]
+                same = bool(ov) and all(_distinct_cols(_file_head_cols(case_dir / g, "ams", file_rules), cols_f)
+                                        for g in ov)
+            if same:
                 groups[-1].append(f)
             else:
                 groups.append([f])
@@ -1403,13 +1508,24 @@ def _plan_runs(case_dir: Path, cf: dict, ref_key: str | None, file_rules: dict |
         notes.append(f"⚠️ 시간이 겹치는 {ref_key.upper()} 파일이 없어 뺀 {other.upper()} 파일: {', '.join(dropped)}")
     for r in runs:
         r[other] = sorted(r[other], key=by_start(other))
-    return runs, notes
+    return with_streams(runs)
 
 
 def _plan_summary(runs: list, notes: list, mode: str) -> dict:
-    joined = [f"{k.upper()} {len(r[k])}개" for r in runs for k in ("br", "ams") if len(r.get(k, [])) > 1]
+    joined = []
+    for r in runs:
+        for k in ("br", "ams"):
+            fl = r.get(k, [])
+            if len(fl) < 2:
+                continue
+            st = (r.get("ams_streams") or []) if k == "ams" else []
+            if len(st) > 1:
+                joined.append(f"AMS {len(fl)}개 → 동시 기록 {len(st)}묶음 나란히")
+            else:
+                joined.append(f"{k.upper()} {len(fl)}개 이어 붙임")
     return {"n": len(runs), "mode": mode, "notes": notes,
-            "runs": [{"br": r.get("br", []), "ams": r.get("ams", [])} for r in runs],
+            "runs": [{"br": r.get("br", []), "ams": r.get("ams", []), "ams_streams": r.get("ams_streams", [])}
+                     for r in runs],
             "joined": joined}
 
 
@@ -1627,6 +1743,11 @@ def _classify_files(folder: Path, file_rules: dict = None, active_sources: list 
         n = f.name.lower()
         if any(tag in n for tag in ["merged", "calc", "result", "formula", ".cache"]):
             continue
+        # 파일명에 AMS 가 있으면 AMS (식별 규칙·내용 판별보다 우선) — AMS_log.csv, 260311_AMS.dat 등
+        if "ams" in file_rules and ams_by_name(f.name):
+            files["ams"].append(f.name)
+            print(f"  [classify] 파일명 판별: {f.name} → AMS")
+            continue
         matched = False
         for src in order:
             rule = file_rules[src]
@@ -1679,8 +1800,11 @@ def _classify_files(folder: Path, file_rules: dict = None, active_sources: list 
 @app.post("/api/scan-columns")
 def scan_columns(req: BrowseRequest):
     """
-    세션의 첫 번째 케이스 폴더에서 BR/AMS/MX100 파일을 읽어
-    사용 가능한 전체 컬럼 목록을 반환한다.
+    선택한 **모든 케이스**의 BR/AMS/MX100/NIDAQ 파일(화면에서 고른 대로)을 읽어
+    사용 가능한 전체 컬럼 목록을 반환한다 — 파일·케이스마다 변수가 달라도 전부 표시.
+    (예전엔 첫 번째 케이스만 읽고, 못 읽은 파일은 서버 콘솔에만 남겨서
+     AMS 파일이 둘이어도 한 파일 변수만 보일 수 있었음)
+    columns[c].files: 그 변수가 있는 파일, files: 파일별 결과 (열 수 / 못 읽은 이유)
     """
     sid = req.path  # session_id를 path 필드로 받음
     if sid not in sessions:
@@ -1690,46 +1814,60 @@ def scan_columns(req: BrowseRequest):
     case_files = s["case_files"]
 
     all_columns = {}
-    dt = DEFAULT_CFG["processing"]["data_time"]
+    scanned = []           # [{case, file, src, cols, error?}]
     fr = DEFAULT_CFG.get("file_rules", {})
     active = DEFAULT_CFG.get("processing",{}).get("data_sources")
+    t_start, budget_s, n_cases = time.perf_counter(), 40.0, 0
 
-    # 첫 번째 케이스에서 샘플 읽기
-    for case_name, cf in case_files.items():
+    def _read_mx_head(p):
+        skip_r = fr.get("mx100", {}).get("skip_rows", 24)
+        df = pd.read_excel(p, skiprows=skip_r, header=0, nrows=5)
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    def _scan_file(case_name, case_dir, label, fp_name, reader):
+        n0 = len(_READ_NOTES)
+        err, df = None, None
+        try:
+            df = reader(case_dir / fp_name)
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+        if df is None or len(df.columns) == 0:
+            notes = [x.strip() for x in _READ_NOTES[n0:] if x.strip()]
+            why = err or (notes[-1] if notes else "열을 하나도 읽지 못함")
+            scanned.append({"case": case_name, "file": fp_name, "src": label, "cols": 0, "error": why})
+            print(f"  [scan] {case_name}/{fp_name} 읽기 실패: {why}")
+            return
+        for i, c in enumerate(df.columns):
+            info = all_columns.get(c)
+            if info is None:
+                info = all_columns[c] = {"source": label, "dtype": str(df.iloc[:, i].dtype), "files": []}
+            if fp_name not in info["files"]:
+                info["files"].append(fp_name)
+        scanned.append({"case": case_name, "file": fp_name, "src": label, "cols": int(len(df.columns))})
+
+    for case_name in case_files:
+        if n_cases and time.perf_counter() - t_start > budget_s:
+            break   # 케이스가 아주 많을 때 — 나머지는 알림만
+        n_cases += 1
         case_dir = category / case_name
         # 최신 파일 목록으로 재분류 + 화면에서 고른 파일(사용/제외·소스) 적용
-        cf = _case_entries(case_dir, fr, active, s.get("overrides", {}).get(case_name),
-                           s.get("pairs", {}).get(case_name))[0]
-
-        def _scan_csv(src_key, label, skip=1):
-            # Merge 와 같은 읽기 함수 사용 → 표에 보이는 이름 = merged 파일 컬럼 이름
-            # (예전엔 따로 읽어서 BOM 붙은 'Time', 헤더 행 자동 조정, 쉼표 포함 헤더가 Merge 와 달랐음)
+        try:
+            cf = _case_entries(case_dir, fr, active, s.get("overrides", {}).get(case_name),
+                               s.get("pairs", {}).get(case_name))[0]
+        except Exception as e:
+            scanned.append({"case": case_name, "file": "", "src": "", "cols": 0,
+                            "error": f"케이스 파일 판별 실패: {type(e).__name__}: {e}"})
+            continue
+        # Merge 와 같은 읽기 함수 사용 → 표에 보이는 이름 = merged 파일 컬럼 이름
+        for src_key, label, skip in (("br", "BR", 1), ("ams", "AMS", 1), ("nidaq", "NIDAQ", 0)):
             for fp_name in cf.get(src_key, []):
-                fp = case_dir / fp_name
-                try:
-                    df = read_source_csv(str(fp), fr, src_key, skip, nrows=5)
-                except Exception as e:
-                    print(f"  [scan] {fp_name} 읽기 실패: {type(e).__name__}: {e}")
-                    continue
-                for c in df.columns:
-                    if c not in all_columns:
-                        all_columns[c] = {"source": label, "dtype": str(df[c].dtype)}
-
-        _scan_csv("br", "BR", skip=1)
-        _scan_csv("ams", "AMS", skip=1)
-        _scan_csv("nidaq", "NIDAQ", skip=0)
-        # MX100 (Excel) — 모든 파일
+                _scan_file(case_name, case_dir, label, fp_name,
+                           lambda p, k=src_key, sk=skip: read_source_csv(str(p), fr, k, sk, nrows=5))
         for mx_name in cf.get("mx100", []):
-            try:
-                fp = case_dir / mx_name
-                skip_r = fr.get("mx100", {}).get("skip_rows", 24)
-                df = pd.read_excel(fp, skiprows=skip_r, header=0, nrows=5)
-                df.columns = [c.strip() for c in df.columns]
-                for c in df.columns:
-                    if c not in all_columns:
-                        all_columns[c] = {"source": "MX100", "dtype": str(df[c].dtype)}
-            except: pass
-        break  # 첫 번째 케이스만
+            _scan_file(case_name, case_dir, "MX100", mx_name, _read_mx_head)
+    if n_cases < len(case_files):
+        print(f"  [scan] 시간이 오래 걸려 케이스 {n_cases}/{len(case_files)}개만 스캔")
 
     # ── config 기반 기본 선택값 (저장된 merge 설정이 없을 때의 폴백) ──
     # column_mappings + selected_columns + scale_factors 를 조합해
@@ -1791,12 +1929,16 @@ def scan_columns(req: BrowseRequest):
     except Exception as e:
         print(f"  [scan] AMS 표시 정보 생성 실패: {e}")
     _READ_NOTES.clear()   # 스캔 중 읽기 메모는 Merge 로그와 무관
-    print(f"  [scan] 컬럼 {len(all_columns)}개, config 기본 체크 {len(defaults)}개")
+    print(f"  [scan] 케이스 {n_cases}개·파일 {len(scanned)}개 → 컬럼 {len(all_columns)}개, "
+          f"config 기본 체크 {len(defaults)}개, 못 읽은 파일 {sum(1 for x in scanned if x.get('error'))}개")
 
     return {
         "total": len(all_columns),
         "columns": all_columns,
         "defaults": defaults,
+        "files": scanned,
+        "cases": n_cases,
+        "cases_total": len(case_files),
     }
 
 
@@ -1899,10 +2041,13 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
             if n and (n > 1 or any(len(r.get(k, [])) > 1 for r in runs for k in ("br", "ams"))):
                 mtxt = {"auto": "자동(시간으로 판단)", "concat": "하나로 이어 붙이기", "separate": "파일마다 따로"}.get(mode, mode)
                 _log(sid, f"  🗂 [{case_name}] 병합 계획 {n}회 — 여러 파일: {mtxt}")
+                def _desc(r, k):
+                    st = (r.get("ams_streams") or []) if k == "ams" else []
+                    if len(st) > 1:
+                        return "AMS " + "  ‖  ".join(" + ".join(s) for s in st) + " (동시 기록 → 나란히 병합)"
+                    return f"{k.upper()} " + " + ".join(r[k]) + (" (시간 순 이어 붙임)" if len(r[k]) > 1 else "")
                 for i, r in enumerate(runs):
-                    _log(sid, f"     {i+1}회: " + " / ".join(
-                        f"{k.upper()} " + (" + ".join(r[k]) + (" (시간 순 이어 붙임)" if len(r[k]) > 1 else ""))
-                        for k in ("br", "ams") if r.get(k)))
+                    _log(sid, f"     {i+1}회: " + " / ".join(_desc(r, k) for k in ("br", "ams") if r.get(k)))
             for m in pnotes:
                 _log(sid, f"     {m}")
             plans.append((case_name, case_dir, cf, ref_eff, runs))
@@ -1918,15 +2063,21 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 # 선택된 소스만 읽기 — BR·AMS 는 이 회차에 배정된 파일(여러 개면 시간 순 이어 붙임),
                 # MX100/NIDAQ 는 전체 파일 리스트
                 bp = [str(case_dir / f) for f in run.get("br", [])] if use_br else None
-                ap = [str(case_dir / f) for f in run.get("ams", [])] if use_ams else None
+                # AMS: 묶음마다 (이어 붙일 조각들), 묶음끼리는 동시 기록 → 시간축에서 나란히
+                ap = [[str(case_dir / f) for f in grp]
+                      for grp in (run.get("ams_streams") or [run.get("ams", [])]) if grp] if use_ams else None
                 mp_list = [str(case_dir / f) for f in cf.get("mx100",[])] if use_mx and cf.get("mx100") else None
                 np_list = [str(case_dir / f) for f in cf.get("nidaq",[])] if use_ni and cf.get("nidaq") else None
 
                 t1 = time.perf_counter()
-                df_ams, df_br, df_mx, ni_parts = _read(ap, bp, mp_list, dt, np_list=np_list, file_rules=cfg.get("file_rules"))
+                ams_parts, df_br, df_mx, ni_parts = _read(ap, bp, mp_list, dt, np_list=np_list, file_rules=cfg.get("file_rules"))
+                df_ams = ams_parts[0] if ams_parts else pd.DataFrame()   # (있는지 확인용 — 묶음은 ams_parts)
                 df_ni = ni_parts[0] if ni_parts else pd.DataFrame()   # NIDAQ 첫 묶음 (기준 시간축용)
                 _READ_NOTES.clear()   # 내용은 print() 로 이미 로그에 전달됨
-                _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (AMS={len(df_ams)}행 BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={sum(len(p) for p in ni_parts)}행/{len(cf.get('nidaq',[]))}파일)")
+                n_ams = sum(len(p) for p in ams_parts)
+                _log(sid, f"  📖 읽기: {time.perf_counter()-t1:.1f}s (AMS={n_ams}행"
+                          + (f"/동시 기록 {len(ams_parts)}묶음" if len(ams_parts) > 1 else "")
+                          + f" BR={len(df_br)}행 MX100={len(df_mx)}행/{len(cf.get('mx100',[]))}파일 NIDAQ={sum(len(p) for p in ni_parts)}행/{len(cf.get('nidaq',[]))}파일)")
 
                 t1 = time.perf_counter()
                 # 선택된 소스만 전처리
@@ -1936,15 +2087,24 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
                 else:
                     df_br_main, df_br_add = pd.DataFrame(), pd.DataFrame()
 
-                if use_ams and not df_ams.empty:
-                    df_ams_proc = preprocess_ams(
-                        df_ams, get_column_mapping(cfg, "ams"),
+                # AMS: 묶음마다 전처리 (동시에 기록한 다른 로거는 열 구성이 달라 각자 이름·배율 처리)
+                ams_procs = []
+                for k_, part in enumerate(ams_parts if use_ams else []):
+                    if part.empty:
+                        continue
+                    if len(ams_parts) > 1:
+                        print(f"  [ams] 묶음 {k_+1}/{len(ams_parts)} 전처리 ({len(part)}행 × {len(part.columns)}열)")
+                    ams_procs.append(preprocess_ams(
+                        part, get_column_mapping(cfg, "ams"),
                         cfg.get("ams_scale_factors", {}), cfg.get("subprocess_mapping", {}),
-                        sel_ams)
-                else:
-                    df_ams_proc = pd.DataFrame()
+                        sel_ams))
+                # 기준 시간축(AMS)으로 쓸 묶음 = 가장 긴 것
+                df_ams_proc = max(ams_procs, key=len) if ams_procs else pd.DataFrame()
                 # 전처리가 실제로 적용한 AMS 로거 배율 (표의 Weight 와 이중 적용 방지용)
-                ams_applied = dict(df_ams_proc.attrs.get("ams_scale_applied", {})) if not df_ams_proc.empty else {}
+                ams_applied = {}
+                for p_ in ams_procs:
+                    for k_, v_ in p_.attrs.get("ams_scale_applied", {}).items():
+                        ams_applied.setdefault(k_, v_)
                 present = {n for n, d in (("BR", df_br), ("AMS", df_ams), ("MX100", df_mx), ("NIDAQ", df_ni))
                            if not d.empty}
                 # [ams] 진단은 preprocess_ams 의 print() 로 이미 로그에 전달됨
@@ -1966,7 +2126,7 @@ def _run_merge(sid: str, cfg: dict, var_settings: dict | None = None):
 
                 t1 = time.perf_counter()
                 merged = sync_and_merge(
-                    [df_br_main, df_br_add, df_mx_proc, df_ams_proc] + (ni_procs or [df_ni_proc]),
+                    [df_br_main, df_br_add, df_mx_proc] + (ams_procs or [df_ams_proc]) + (ni_procs or [df_ni_proc]),
                     ref_eff, df_br_main, df_ams_proc, df_mx_proc, df_nidaq=df_ni_proc)
                 _log(sid, f"  🔗 시간동기화: {time.perf_counter()-t1:.1f}s ({len(merged)}행)")
 
@@ -2721,9 +2881,15 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
         paths = [p_ for p_ in ([paths] if isinstance(paths, str) else (paths or [])) if p_ and os.path.exists(p_)]
         parts = []
         for p_ in paths:
-            d = _read_csv(p_, src_key, 1)
+            try:
+                d = _read_csv(p_, src_key, 1)
+            except Exception as e:   # 한 파일을 못 읽어도 나머지로 계속
+                print(f"  [{label}] ⚠️ {os.path.basename(p_)} 읽기 실패 → 이 파일은 빼고 병합: {type(e).__name__}: {str(e)[:150]}")
+                continue
             if d is not None and not d.empty:
                 parts.append((p_, d))
+            else:
+                print(f"  [{label}] ⚠️ {os.path.basename(p_)}: 읽은 데이터가 없어 빼고 병합")
         if not parts:
             return pd.DataFrame()
         if len(parts) == 1:
@@ -2743,7 +2909,19 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
         return pd.concat([d for _, d in parts], ignore_index=True, sort=False)
 
     df_b = _read_parts(bp, "br", "BR")
-    df_a = _read_parts(ap, "ams", "AMS")
+    # AMS: ap = 묶음 목록 [[조각, …], …] (경로 하나·경로 목록도 받음 → 한 묶음)
+    if isinstance(ap, str):
+        ap = [[ap]]
+    elif ap and not isinstance(ap[0], (list, tuple)):
+        ap = [list(ap)]
+    ams_parts = []
+    for grp in (ap or []):
+        d = _read_parts(list(grp), "ams", "AMS")
+        if not d.empty:
+            ams_parts.append(d)
+    if len(ams_parts) > 1:
+        print(f"  [AMS] 동시에 기록한 파일 묶음 {len(ams_parts)}개 → 각각 전처리해서 1초 시간축에서 나란히 병합: "
+              + "  ‖  ".join(" + ".join(os.path.basename(x) for x in grp) for grp in ap if grp))
 
     # MX100: 여러 파일 → 컬럼 병합
     if mp_list:
@@ -2775,7 +2953,7 @@ def _read(ap, bp, mp_list, dt, np_list=None, file_rules=None):
                 print(f"  [NIDAQ] 열 구성이 같은 파일 {len(g)}개 → 이어 붙임")
             ni_parts.append(pd.concat(g, ignore_index=True) if len(g) > 1 else g[0])
 
-    return df_a, df_b, df_m, ni_parts
+    return ams_parts, df_b, df_m, ni_parts
 
 def _log(sid, msg):
     if sid in sessions: sessions[sid]["log"].append(msg)

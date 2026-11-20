@@ -2,8 +2,23 @@
 io_handler.py — 파일 탐색, 읽기, 쓰기, 이름 변환
 """
 import os
+import re
 import glob
 import pandas as pd
+
+
+# ──────────────────────────────────────────────
+#  파일 이름으로 AMS 판별
+# ──────────────────────────────────────────────
+# 이름에 AMS 가 단어로 들어 있으면 AMS 파일로 봄 — AMS_log.csv, 260311_AMS.dat, ams-2.csv, TestAMS2.csv
+# (streams·programs·DREAMS 처럼 다른 단어 속의 ams 는 제외)
+AMS_NAME_RX = re.compile(r"(?<![A-Za-z])[Aa][Mm][Ss]|(?<=[a-z])AMS")
+AMS_NAME_EXTS = (".csv", ".tsv", ".txt", ".dat")
+
+
+def ams_by_name(filename: str) -> bool:
+    stem, ext = os.path.splitext(os.path.basename(str(filename)))
+    return ext.lower() in AMS_NAME_EXTS and bool(AMS_NAME_RX.search(stem))
 
 
 # ──────────────────────────────────────────────
@@ -30,6 +45,7 @@ def rename_files_in_folder(folder_path: str) -> dict:
     폴더 내 .csv → _br.csv, .xls → _temp.xls 로 이름 변경.
     - 이미 BR/_br 또는 MX100/_temp 파일이 존재하면 변환하지 않음
     - _merged, _calc, _formula, _result 파일은 절대 변환하지 않음
+    - 이름에 AMS 가 있는 파일(AMS_log.csv 등)은 AMS 로 쓰이므로 변환하지 않음
     반환: {원래 이름: 새 이름} (케이스 파일 선택을 바뀐 이름에 맞추는 데 사용)
     """
     renamed = {}
@@ -53,7 +69,8 @@ def rename_files_in_folder(folder_path: str) -> dict:
             continue
 
         new_name = None
-        if ext.lower() == ".csv" and not has_br and not nl.endswith("_br") and "_ams" not in nl:
+        if ext.lower() == ".csv" and not has_br and not nl.endswith("_br") and "_ams" not in nl \
+                and not ams_by_name(filename):
             new_name = f"{name}_br{ext}"
         elif ext.lower() in (".xls", ".xlsx") and not has_mx and not nl.endswith("_temp"):
             new_name = f"{name}_temp{ext}"
