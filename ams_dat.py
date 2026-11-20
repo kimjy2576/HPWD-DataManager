@@ -20,11 +20,14 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+import ams_proj   # 같은 폴더 프로젝트 파일(.proj)로 바로 읽기 (학습 불필요) — 먼저 시도
 
 FORMAT_DIR = Path(__file__).resolve().parent / "config" / "ams_dat_formats"
 SPEC_VERSION = "ams-dat-1"
@@ -1197,6 +1200,12 @@ def _rec_ok(rec: np.ndarray, spec: dict) -> bool:
 def time_bounds(path) -> dict | None:
     """학습한 형식으로 첫·마지막 기록의 시각 → {"kind": "abs"|"tod", "start", "end"} (초, 현지 시각 기준).
     여러 .dat 를 이어 붙일지·어느 BR 과 짝지을지 정하는 데 씀. 경과 시간뿐이면 None."""
+    try:
+        tb = ams_proj.time_bounds(path)     # 프로젝트 파일(.proj)로 읽히는 .dat
+        if tb is not None:
+            return tb
+    except Exception:
+        pass
     buf = read_bytes(path)
     sp, st = find_spec(path, head=buf)
     if sp is None:
@@ -1236,14 +1245,39 @@ def time_bounds(path) -> dict | None:
     return None
 
 
+def readable(path, size: int | None = None) -> str | None:
+    """이 .dat 를 읽을 방법 → 짧은 설명 | None.
+    ① 같은 폴더의 AMS 프로젝트 파일(.proj) 채널 배치 (학습 불필요)  ② 학습한 형식."""
+    try:
+        how = ams_proj.describe(path)
+        if how:
+            return how
+        sp, _ = find_spec(path, head=read_bytes(path, 2 << 20),
+                          size=size if size is not None else os.path.getsize(path))
+        return f"학습한 형식 {sp.get('_file', '')}" if sp is not None else None
+    except Exception:
+        return None
+
+
 def read_dat(path, nrows: int | None = None, log=print) -> pd.DataFrame:
-    """학습된 형식으로 AMS .dat 읽기. 맞는 형식이 없으면 빈 DataFrame."""
+    """AMS .dat 읽기 — ① 같은 폴더의 프로젝트 파일(.proj) 채널 배치로 (hpwd-studio-task #13 변환 코드와 같은 방식,
+    학습 불필요)  ② 안 되면 학습된 형식으로. 둘 다 안 되면 빈 DataFrame."""
+    name = Path(path).name
+    why = []
+    lay = ams_proj.layout_for(path, why)
+    if lay is not None:
+        try:
+            df = ams_proj.read(path, nrows=nrows, log=log, layout=lay)
+            if df is not None:
+                return df
+        except Exception as e:
+            log(f"  [ams_dat] {name}: ⚠️ 프로젝트 파일로 읽다 실패 ({type(e).__name__}: {e}) → 학습한 형식으로 시도")
     buf = read_bytes(path)
     sp, start = find_spec(path, head=buf)
-    name = Path(path).name
     if sp is None:
-        log(f"  [ams_dat] {name}: ⚠️ 학습된 AMS .dat 형식과 맞지 않음 — 케이스 확정 후 '파일 선택'에서 "
-            f"같은 측정을 AMS 에서 내보낸 CSV 를 골라 [형식 학습] (또는 diagnose.bat)")
+        log(f"  [ams_dat] {name}: ⚠️ 읽을 수 없음 — {why[0] if why else '프로젝트 파일로 못 읽음'}, 학습한 형식도 맞지 않음. "
+            f"AMS 측정 폴더의 프로젝트 파일(.proj)을 .dat 와 같은 폴더에 두면 바로 읽힘 "
+            f"(또는 '파일 선택'에서 같은 측정의 AMS CSV 로 [형식 학습])")
         return pd.DataFrame()
     df = decode(buf, sp, start, nrows)
     miss = [c for c in sp["csv_columns"] if c not in df.columns]

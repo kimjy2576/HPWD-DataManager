@@ -1203,15 +1203,14 @@ def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
             e["why"] = "자동 판별 대상 아님 — 쓰려면 체크하고 소스를 고르세요"
         no_spec = False
         if kind == "binary" and nl.endswith(".dat") and (e["auto"] == "ams" or e["src"] == "ams"):
-            # 파일명으로 AMS 가 됐거나 직접 AMS 로 고른 바이너리 .dat — 맞는 학습 형식이 없으면 아직 못 읽음
-            try:
-                no_spec = ams_dat.find_spec(str(x), head=ams_dat.read_bytes(str(x), 2 << 20),
-                                            size=e["size"])[0] is None
-            except Exception:
-                no_spec = True
+            # AMS 바이너리 .dat — 같은 폴더 .proj 로 읽히거나 학습한 형식이 있어야 읽힘
+            how = ams_dat.readable(str(x), size=e["size"])
+            no_spec = how is None
             if no_spec:
-                e["warn"] = ("바이너리 .dat 인데 맞는 학습 형식이 없어 아직 읽을 수 없음 — 아래에서 같은 측정을 "
-                             "AMS 에서 내보낸 CSV 를 골라 [형식 학습] 하세요 (안 하면 병합에서 빠짐)")
+                e["warn"] = ("바이너리 .dat 인데 아직 읽을 수 없음 — AMS 측정 폴더의 프로젝트 파일(.proj)을 같은 폴더에 "
+                             "두면 바로 읽힘 (또는 아래에서 같은 측정의 AMS CSV 로 [형식 학습]). 안 하면 병합에서 빠짐")
+            else:
+                e["via"] = how
         if nl.endswith(".dat") and kind in ("binary", "excel") and (e["auto"] != "ams" or no_spec):
             e["learn"] = True
             k0 = _stem_key(x.name)
@@ -1691,17 +1690,13 @@ def _auto_text_source(path: Path, file_rules: dict):
     BR 은 열 이름 특징('t_air_', 'p_comp' 등)이 일반 계측 채널 이름과 겹쳐 자동으로 고르지 않음."""
     kind, enc = _file_kind(path)
     if kind == "binary":
-        try:
-            size = os.path.getsize(path)
-            sp, _ = ams_dat.find_spec(path, head=ams_dat.read_bytes(path, 2 << 20), size=size)
-        except Exception:
-            sp = None
-        if sp is not None:
+        how = ams_dat.readable(str(path))     # 같은 폴더 .proj 또는 학습한 형식
+        if how:
             if "ams" in file_rules:
-                return "ams", f"AMS 바이너리 — 학습한 형식 {sp.get('_file', '')}"
+                return "ams", f"AMS 바이너리 — {how}"
             return None, "AMS 바이너리지만 AMS 소스가 꺼져 있음 — Setting 의 사용 소스에서 AMS 를 켜면 병합됨"
-        return None, ("바이너리 파일 — AMS 프로그램 .dat 이면 '파일 선택'에서 같은 측정을 AMS 에서 내보낸 CSV 를 "
-                      "골라 [형식 학습] 을 한 번 누르면 읽힘")
+        return None, ("바이너리 파일 — AMS 프로그램 .dat 이면 측정 폴더의 프로젝트 파일(.proj)을 같은 폴더에 두면 "
+                      "바로 읽힘 (또는 '파일 선택'에서 같은 측정의 AMS CSV 로 [형식 학습])")
     if kind == "excel":
         return None, "엑셀 형식 — MX100 확장자 규칙에 넣으면 MX100 으로 읽음"
     if kind != "text":

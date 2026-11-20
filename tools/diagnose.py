@@ -599,6 +599,21 @@ def diagnose_binary(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool,
     if fl["strings"] and not mask:
         R.add("  앞부분 글자: " + " | ".join(f"@{o} {t[:30]}" for o, t, _ in fl["strings"][:12]))
 
+    # ① 같은 폴더의 AMS 프로젝트 파일(.proj) 채널 배치로 바로 읽히는지 (학습 불필요)
+    import ams_proj as P
+    why = []
+    lay = P.layout_for(path, why)
+    if lay is not None:
+        df, _ = quiet(P.read, path, None, lambda *a: None, lay)
+        R.flag("ok", f"프로젝트 파일 {Path(lay['proj']).name} 의 채널 배치와 일치 → 앱에서 AMS 로 바로 읽힘 (학습 불필요): "
+                     f"{len(df):,}행 × {len(df.columns)}열, 기록 {lay['rec']}바이트")
+        R.add(f"    확인: {lay['check']}")
+        if not mask and len(df):
+            R.add(f"    시각 {df['Time'].iloc[0]} ~ {df['Time'].iloc[-1]}")
+            R.add("    계측 채널: " + (", ".join(c for c, _, _ in lay["chans"][:20]) or "없음"))
+        return {"ok": True}
+    R.add(f"  프로젝트 파일(.proj)로는 못 읽음: {why[0] if why else '-'}")
+
     sp, st = A.find_spec(path, head=buf)
     if sp is not None:
         df, lines = quiet(A.decode, buf, sp, st)

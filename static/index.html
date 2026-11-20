@@ -169,9 +169,10 @@ return<div key={c}>
       {e.auto&&e.src&&e.auto!==e.src&&<span style={{color:'var(--tx3)'}}>(자동 판별: {e.auto.toUpperCase()})</span>}
       {e.why&&!e.src&&<span style={{color:'#b45309'}}>{e.why}</span>}
       {e.warn&&e.src&&<span style={{color:'#b45309'}}>⚠️ {e.warn}</span>}
+      {e.via&&e.src&&<span style={{color:'var(--tx3)'}}>({e.via} 로 읽음)</span>}
     </div>
     {e.learn&&<div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',margin:'3px 0 4px 22px'}}>
-      <span style={{color:'var(--tx2)'}}>AMS .dat 형식 학습 — 같은 측정을 AMS 에서 내보낸 CSV:</span>
+      <span style={{color:'var(--tx2)'}}>AMS 측정 폴더의 프로젝트 파일(.proj)을 이 폴더에 넣으면 바로 읽힘 · 없으면 형식 학습 — 같은 측정을 AMS 에서 내보낸 CSV:</span>
       <select value={pick} onChange={ev=>setLrn(p=>({...p,[k]:{...L,csv:ev.target.value}}))} style={{fontSize:10,padding:'1px 4px',maxWidth:260}}>
         {(e.csvs||[]).map(x=><option key={x} value={x}>{x}</option>)}<option value="__path">다른 폴더의 CSV (경로 입력)…</option>
       </select>
@@ -3121,7 +3122,7 @@ return(<div><div className="fg"><div>
 </div>
 
 <div className="cd"><div className="ct">파일 식별 규칙</div>
-<div style={{fontSize:11,color:'var(--tx3)',marginBottom:8}}>각 소스별로 파일을 구별하는 규칙을 설정합니다. 우선순위: MX100 → NIDAQ → AMS → BR (마지막 폴백)<br/>규칙에 안 맞는 <b>.dat</b> 는 내용을 보고 판별합니다 — AMS 형식이면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 병합. .csv/.tsv 가 아닌 확장자(.dat, .txt 등)는 구분자·헤더 줄·단위 줄·인코딩을 자동으로 판별해 읽습니다 (.txt 등은 위 확장자 칸에 넣어야 사용)<br/><b>AMS 프로그램 바이너리 .dat</b> 는 Merge 탭에서 케이스 확정 후 '파일 선택' → 같은 측정의 CSV 를 골라 [형식 학습] 을 한 번 하면 AMS 로 읽습니다 (diagnose.bat 으로도 가능)</div>
+<div style={{fontSize:11,color:'var(--tx3)',marginBottom:8}}>각 소스별로 파일을 구별하는 규칙을 설정합니다. 우선순위: MX100 → NIDAQ → AMS → BR (마지막 폴백)<br/>규칙에 안 맞는 <b>.dat</b> 는 내용을 보고 판별합니다 — AMS 형식이면 AMS, 그 밖의 표 형태 계측 데이터는 NIDAQ(일반 계측)으로 병합. .csv/.tsv 가 아닌 확장자(.dat, .txt 등)는 구분자·헤더 줄·단위 줄·인코딩을 자동으로 판별해 읽습니다 (.txt 등은 위 확장자 칸에 넣어야 사용)<br/><b>AMS 프로그램 바이너리 .dat</b> 는 같은 폴더에 측정 프로젝트 파일(<b>.proj</b>)이 있으면 그 채널 배치로 바로 읽습니다 (학습 불필요). .proj 가 없을 때만 Merge 탭에서 케이스 확정 후 '파일 선택' → 같은 측정의 CSV 를 골라 [형식 학습] (diagnose.bat 으로도 가능)</div>
 {['mx100','nidaq','ams','br'].map(src=>{
   const rule=l?.file_rules?.[src]||{};
   const setRule=(k,v)=>{const fr=JSON.parse(JSON.stringify(l?.file_rules||{}));if(!fr[src])fr[src]={};fr[src][k]=v;s('file_rules',fr)};
