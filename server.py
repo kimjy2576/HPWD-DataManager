@@ -1667,6 +1667,37 @@ class AmsLearnReq(BaseModel):
     csv: str
 
 
+class AmsProjReq(BaseModel):
+    session_id: str
+    case: str
+    dat: str
+
+
+@app.post("/api/ams-proj/channels")
+def ams_proj_channels(req: AmsProjReq):
+    """케이스의 AMS .dat 옆 프로젝트 파일(.proj) 채널 정의 전체 (측정값 없음) — 어떤 변수가 정의돼 있고
+    앱이 무엇을 읽는지, 스마트 패킷 변수의 위치 속성이 있는지 보는 용도."""
+    s = sessions.get(req.session_id)
+    if not s:
+        raise HTTPException(404, "세션 없음 — 케이스 확정을 다시 누르세요")
+    if Path(req.dat).name != req.dat or Path(req.case).name != req.case:
+        raise HTTPException(400, "파일 이름이 올바르지 않음")
+    dat = Path(s["category_path"]) / req.case / req.dat
+    if not dat.is_file():
+        raise HTTPException(404, f"파일 없음: {req.dat}")
+    lay = ams_proj.layout_for(dat)
+    projs = [Path(lay["proj"])] if lay else ams_proj.find_proj(dat)
+    if not projs:
+        raise HTTPException(404, "같은 폴더에 AMS 프로젝트 파일(.proj)이 없음")
+    try:
+        t = ams_proj.channel_table(projs[0])
+    except Exception as e:
+        raise HTTPException(400, f"{projs[0].name} 을(를) 읽을 수 없음: {e}")
+    t["match"] = bool(lay)
+    t["others"] = [q.name for q in ams_proj.find_proj(dat) if q != projs[0]]
+    return t
+
+
 @app.post("/api/ams-dat/learn")
 def ams_dat_learn(req: AmsLearnReq):
     """앱 안에서 AMS .dat 형식 학습 — 케이스 폴더의 .dat 와 같은 측정의 CSV 를 비교 (tools/diagnose.py 와 같은 학습)."""

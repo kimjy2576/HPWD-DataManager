@@ -545,3 +545,93 @@ def describe(dat_path) -> str | None:
     if not L:
         return None
     return f"프로젝트 파일 {Path(L['proj']).name}" + (" (시각 확인 못 함)" if L.get("weak") else "")
+
+
+# ──────────────────────────────────────────────
+#  프로젝트 파일 채널 정의 보기 (측정값 없음)
+# ──────────────────────────────────────────────
+# 원 코드가 스마트 패킷에서 꺼내는 값의 바이트 위치 (패킷 시작 STX = 0, 2바이트는 앞 바이트 위치).
+# 패킷 종류([3])마다 바뀌는 값은 (위치, 종류).
+KNOWN_POS = {
+    "currentrpm": 9, "requestrpm": 11, "absiqeref": 29, "iqeref": 29, "vibfy": 31, "vibry": 33,
+    "washthermistortemperature": 46, "steamthermistortemperature": 48, "watersensorfrequency": 52,
+    "eev": 69, "eevcurrentposition": 69, "coolingfan": 71, "comptargethz": 72, "compcurrenthz": 73,
+    "compipmtemp": 74, "fanspeed": 75, "dryftemp": 79, "superheatdegree": 82, "qcurrent": 116,
+    "고객선택코스정보": (155, 0), "cycle동작횟수": (155, 1), "남은시간": (160, 1),
+    "행정정보1대행정정보": (164, 1), "행정정보2소행정정보": (165, 1),
+    "세탁포량level": (172, 1), "세탁포량감지rawdata": (173, 1), "탈수포량level": (172, 2), "탈수포량감지rawdata": (173, 2),
+    "건조외기감지값": (158, 3), "dryductintemp": (164, 3), "dryductouttemp": (165, 3), "dryevaintemp": (166, 3),
+    "dryevaouttemp": (167, 3), "renewaltime": (160, 3), "건조포량level": (172, 3), "건조포량rawdata": (173, 3),
+    "heatpumpcomptemp": (175, 3),
+}
+
+
+def _norm(name: str) -> str:
+    """이름 비교용 — 배율 표기·공백·기호를 빼고 소문자 (한글 유지)."""
+    s = re.sub(r"\[[^\]]*\]", "", str(name or "")).lower()
+    return re.sub(r"[^0-9a-z가-힣]", "", s)
+
+
+def _smart_read_names() -> dict:
+    """앱이 스마트 패킷에서 읽는 열 {비교용 이름: 열 이름}."""
+    P = np.zeros((1, 200), np.uint8)
+    out = {_norm(n): n for n, _ in _smart_columns(P)}
+    out.setdefault("eevcurrentposition", "Eev")
+    return out
+
+
+def channel_table(proj_path) -> dict:
+    """프로젝트 파일의 <Channel> 정의 전체 (속성 그대로) — 계측/스마트 구역, 앱이 읽는지,
+    그리고 스마트 채널의 숫자 속성 중 원 코드의 바이트 위치와 맞는 것이 있는지 (다른 변수도 읽을 수 있는지 판단용)."""
+    root = _xml_root(proj_path)
+    L = parse_proj(proj_path)
+    normal = iter(L["chans"])
+    read_names = _smart_read_names()
+    attrs, rows, in_smart = [], [], False
+    for el in root.iter():
+        if str(el.tag).split("}")[-1] != "Channel":
+            continue
+        a = {str(k): str(v) for k, v in el.attrib.items()}
+        for k in a:
+            if k not in attrs:
+                attrs.append(k)
+        name = a.get("Name") or ""
+        if name == "STX":
+            zone, in_smart = "stx", True
+        elif name == "ETX":
+            zone, in_smart = "etx", False
+        else:
+            zone = "smart" if in_smart else "normal"
+        r = {"zone": zone, "attrs": a, "read": None, "col": None, "pos": None}
+        if zone == "normal":
+            try:
+                col, s, e = next(normal)
+                r.update(read=True, col=col, pos=f"{s}~{e - 1}")
+            except StopIteration:
+                pass
+        elif zone == "smart":
+            col = read_names.get(_norm(name))
+            r.update(read=bool(col), col=col)
+        rows.append(r)
+    # 스마트 채널의 숫자 속성 ↔ 원 코드 바이트 위치 (같은 이름끼리, 차이가 일정하면 그 속성이 위치)
+    smart = [r for r in rows if r["zone"] == "smart"]
+    hints = []
+    for k in attrs:
+        if k in ("Name", "Type"):
+            continue
+        diffs = []
+        for r in smart:
+            kp = KNOWN_POS.get(_norm(r["attrs"].get("Name", "")))
+            v = _num(r["attrs"].get(k))
+            if kp is not None and v is not None:
+                diffs.append(v - (kp[0] if isinstance(kp, tuple) else kp))
+        if len(diffs) >= 3:
+            d, cnt = max(((d, diffs.count(d)) for d in set(diffs)), key=lambda x: x[1])
+            hints.append({"attr": k, "matched": cnt, "known": len(diffs), "shift": d})
+    hints.sort(key=lambda h: -h["matched"])
+    return {
+        "proj": Path(proj_path).name, "attrs": attrs, "rows": rows, "rec": L["rec"], "stx": L["stx"], "etx": L["etx"],
+        "n_normal": sum(1 for r in rows if r["zone"] == "normal"),
+        "n_smart": len(smart), "n_smart_read": sum(1 for r in smart if r["read"]),
+        "n_app_smart": len(read_names) - 1, "pos_hints": hints,
+    }

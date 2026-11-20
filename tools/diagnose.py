@@ -578,6 +578,28 @@ def csv_partner(dat: Path, extra: list | None = None) -> Path | None:
     return cs[0] if len(cs) == 1 else None
 
 
+def _proj_channels(R: Report, proj: Path, mask: bool):
+    """프로젝트 파일 채널 정의 요약 (측정값 없음) — 통신 패킷 변수를 더 읽을 수 있는지 판단용."""
+    import ams_proj as P
+    try:
+        t = P.channel_table(proj)
+    except Exception as e:
+        R.add(f"  프로젝트 파일 {proj.name} 채널 정의를 읽을 수 없음: {e}")
+        return
+    R.add(f"  프로젝트 파일 {t['proj']} 채널: 계측 {t['n_normal']}개 (모두 읽음) · 통신 패킷(STX~ETX) 안 {t['n_smart']}개 "
+          f"(이름이 같아 앱이 읽는 것 {t['n_smart_read']}개, 앱이 패킷에서 꺼내는 값 {t['n_app_smart']}개)")
+    R.add(f"    채널 속성: {', '.join(t['attrs'])}")
+    h = t["pos_hints"][0] if t["pos_hints"] else None
+    R.add("    " + (f"숫자 속성 '{h['attr']}' 이 원 코드 바이트 위치와 {h['known']}개 중 {h['matched']}개 일치 (차이 {h['shift']})"
+                     if h else "통신 패킷 채널에 원 코드 바이트 위치와 견줄 숫자 속성 없음"))
+    if not mask:
+        sm = [r for r in t["rows"] if r["zone"] == "smart"]
+        for r in sm[:120]:
+            R.add("      " + " | ".join(f"{k}={v}" for k, v in r["attrs"].items()) + (" ← 앱이 읽음" if r["read"] else ""))
+        if len(sm) > 120:
+            R.add(f"      … 외 {len(sm) - 120}개")
+
+
 def diagnose_binary(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool, partner: Path | None) -> dict:
     """바이너리 .dat — 구조 첫인상, 학습된 AMS 형식과 맞는지, (짝 CSV 가 있으면) 형식 학습."""
     import ams_dat as A
@@ -615,8 +637,11 @@ def diagnose_binary(R: Report, path: Path, label: str, srv, cfg, fr, mask: bool,
         if not mask and len(df):
             R.add(f"    시각 {df['Time'].iloc[0]} ~ {df['Time'].iloc[-1]}")
             R.add("    계측 채널: " + (", ".join(c for c, _, _ in lay["chans"][:20]) or "없음"))
+        _proj_channels(R, Path(lay["proj"]), mask)
         return {"ok": True}
     R.add(f"  프로젝트 파일(.proj)로는 못 읽음: {why[0] if why else '-'}")
+    for q in P.find_proj(path)[:1]:
+        _proj_channels(R, q, mask)
 
     sp, st = A.find_spec(path, head=buf)
     if sp is not None:

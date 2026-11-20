@@ -93,6 +93,9 @@ const[files,setFiles]=useState({});      // 케이스별 파일 목록 [{file,si
 const[ovr,setOvr]=useState({});          // 화면에서 고른 것 {케이스:{파일:소스|null}}
 const[openC,setOpenC]=useState(new Set());
 const[lrn,setLrn]=useState({});          // AMS .dat 형식 학습 {케이스/파일:{csv,path,busy,res}}
+const[projView,setProjView]=useState(null); // .proj 채널 정의 표
+const showProj=async(c,e)=>{try{const r=await fetch(`${API}/api/ams-proj/channels`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sid,case:c,dat:e.file})});
+  const d=await r.json();if(!r.ok){alert('❌ '+(d.detail||r.status));return}setProjView(d)}catch(err){alert(err.message)}};
 const[plans,setPlans]=useState({});      // 케이스별 병합 계획 {n, mode, runs:[{br,ams}], joined, notes}
 const browse=async()=>{setBusy(true);try{const r=await fetch(`${API}/api/browse`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});const d=await r.json();if(!r.ok){alert(d.detail);setBusy(false);return}setCases(d.cases||[]);setPath(d.path);localStorage.setItem('dryer_path',d.path);setSel(new Set(d.cases||[]))}catch(e){alert(e.message)}setBusy(false)};
 const confirm=async()=>{if(!sel.size){alert('선택 없음');return}try{const r=await fetch(`${API}/api/select`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({category_path:path,case_names:[...sel]})});const d=await r.json();if(!r.ok){alert(d.detail);return}setSid(d.session_id);setCf(d.cases||{});setUnm(d.unmatched||{});setFiles(d.files||{});setOvr({});setLrn({});setPlans(d.plans||{});
@@ -126,6 +129,7 @@ const learnDat=async(c,e)=>{const k=c+'/'+e.file;const L=lrn[k]||{};const pick=L
     }
   }catch(err){setLrn(p=>({...p,[k]:{...L,busy:false,res:{ok:false,why:err.message}}}))}};
 return(<div className="cd"><div className="ct">데이터 경로</div>
+{projView&&<ProjChannelsDialog data={projView} onClose={()=>setProjView(null)}/>}
 <div className="pr"><input className="pi" value={path} onChange={e=>setPath(e.target.value)} placeholder="D:\실험데이터" onKeyDown={e=>e.key==='Enter'&&browse()}/><button className="bt bp" onClick={browse} disabled={busy}>{busy?'탐색 중...':'경로 탐색'}</button></div>
 {cases.length>0&&<><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}><span className="it">{cases.length}개 케이스 — {sel.size}개 선택</span><div style={{display:'flex',gap:6}}><button className="bt bs" onClick={()=>setSel(new Set(cases))}>전체</button><button className="bt bs" onClick={()=>setSel(new Set())}>해제</button></div></div>
 <div className="cl">{cases.map(c=><div key={c} className={`ci ${sel.has(c)?'on':''}`} onClick={()=>tog(c)}><input type="checkbox" checked={sel.has(c)} readOnly/><span>{c}</span></div>)}</div>
@@ -180,6 +184,7 @@ return<div key={c}>
       {e.why&&!e.src&&<span style={{color:'#b45309'}}>{e.why}</span>}
       {e.warn&&e.src&&<span style={{color:'#b45309'}}>⚠️ {e.warn}</span>}
       {e.via&&<span style={{color:'var(--tx3)'}}>({e.via} 로 {e.src?'읽음':'읽을 수 있음'})</span>}
+      {e.proj?.files?.length>0&&<button className="bt bs" style={{fontSize:9,padding:'0 6px'}} onClick={()=>showProj(c,e)} title="프로젝트 파일에 정의된 채널 전체와 앱이 읽는 것 (측정값 없음)">📋 .proj 채널</button>}
     </div>
     {e.learn&&<div style={{display:'flex',alignItems:'center',gap:6,flexWrap:'wrap',margin:'3px 0 4px 22px'}}>
       <span style={{color:'var(--tx2)'}}>AMS 측정 폴더의 프로젝트 파일(.proj)을 이 폴더에 넣으면 바로 읽힘 · 없으면 형식 학습 — 같은 측정을 AMS 에서 내보낸 CSV:</span>
@@ -1215,6 +1220,45 @@ const vwAutoCats=vars=>{
 const vwBase=n=>n.replace(/(_calc_formula|_merged_formula|_formula|_calc|_merged)\.(csv|xlsx|xls)$/i,'').replace(/\.(csv|xlsx|xls)$/i,'');
 
 // 이름 변경 대화상자 — 폴더 / 케이스(파일 여러 개) / 파일 하나
+// AMS 프로젝트 파일(.proj) 채널 정의 표 — 측정값 없음. 어떤 변수가 정의돼 있고 앱이 무엇을 읽는지
+function ProjChannelsDialog({data,onClose}){
+  const d=data;const at=d.attrs||[];
+  const zl={normal:'계측',smart:'통신 패킷',stx:'STX',etx:'ETX'};
+  const tsv=[['#','구역',...at,'앱 열','읽음'].join('\t'),...(d.rows||[]).map((r,i)=>[i+1,zl[r.zone],...at.map(k=>r.attrs[k]??''),r.col||'',r.read==null?'':r.read?'O':'X'].join('\t'))].join('\n');
+  const h=d.pos_hints?.[0];
+  return(<div onMouseDown={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,.35)',zIndex:2000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}>
+    <div onMouseDown={e=>e.stopPropagation()} style={{background:'var(--bg)',border:'1px solid var(--bd2)',borderRadius:10,padding:18,width:'min(1000px,100%)',maxHeight:'90vh',display:'flex',flexDirection:'column',boxShadow:'0 12px 36px rgba(0,0,0,.25)'}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+        <div style={{fontSize:14,fontWeight:600}}>프로젝트 파일 채널 — {d.proj}</div>
+        <span style={{fontSize:10,padding:'1px 6px',borderRadius:4,...(d.match?{background:'rgba(22,163,74,.1)',color:'#16a34a'}:{background:'rgba(234,179,8,.14)',color:'#b45309'})}}>{d.match?'이 .dat 와 맞음':'⚠️ 이 .dat 와 안 맞음'}</span>
+        <span style={{flex:1}}/><button className="bt bs" onClick={onClose}>닫기</button>
+      </div>
+      <div style={{fontSize:11,color:'var(--tx2)',lineHeight:1.7,marginBottom:8}}>
+        <div>· 계측 채널 <b>{d.n_normal}개</b> — 모두 읽음 (각 4바이트 값)</div>
+        <div>· 통신 패킷(STX~ETX, {d.etx-d.stx-1}바이트) 안 채널 <b>{d.n_smart}개</b> — 이름이 같아 앱이 읽는 것 {d.n_smart_read}개 · 앱은 원 코드처럼 패킷에서 {d.n_app_smart}개 값을 정해진 바이트 위치로 꺼냄</div>
+        <div>· 채널 속성: {at.join(', ')||'-'}</div>
+        <div style={{color:h&&h.matched>=Math.max(3,h.known*0.7)?'#16a34a':'#b45309'}}>· {h?`숫자 속성 '${h.attr}' 이 원 코드의 바이트 위치와 ${h.known}개 중 ${h.matched}개 일치${h.shift?` (차이 ${h.shift})`:''}${h.matched>=Math.max(3,h.known*0.7)?' → 패킷 채널의 위치 정보로 보임 (모든 패킷 변수를 읽을 수 있을 가능성 높음)':' → 위치 정보로 보기 어려움'}`:'통신 패킷 채널에 원 코드 바이트 위치와 견줄 숫자 속성이 없음 (이름이 같은 채널이 3개 미만이거나 위치 속성 없음)'}</div>
+        {d.others?.length>0&&<div>· 같은 폴더의 다른 프로젝트 파일: {d.others.join(', ')}</div>}
+      </div>
+      <div style={{overflow:'auto',border:'1px solid var(--bd)',borderRadius:6,flex:1,minHeight:120}}>
+        <table style={{borderCollapse:'collapse',fontSize:11,width:'100%',textAlign:'left'}}>
+          <thead><tr style={{position:'sticky',top:0,background:'var(--bg3)'}}>{['#','구역',...at,'앱 열','읽음'].map(k=><th key={k} style={{textAlign:'left',padding:'4px 6px',borderBottom:'1px solid var(--bd)',whiteSpace:'nowrap'}}>{k}</th>)}</tr></thead>
+          <tbody>{(d.rows||[]).map((r,i)=><tr key={i} style={{background:r.zone==='smart'?'rgba(37,99,235,.04)':r.zone==='normal'?'transparent':'var(--bg2)'}}>
+            <td style={{padding:'2px 6px',color:'var(--tx3)',textAlign:'left'}}>{i+1}</td>
+            <td style={{padding:'2px 6px',whiteSpace:'nowrap',textAlign:'left'}}>{zl[r.zone]}</td>
+            {at.map(k=><td key={k} style={{padding:'2px 6px',fontFamily:'var(--mono)',whiteSpace:'nowrap',textAlign:'left'}}>{r.attrs[k]??''}</td>)}
+            <td style={{padding:'2px 6px',fontFamily:'var(--mono)',whiteSpace:'nowrap',color:'var(--tx2)',textAlign:'left'}}>{r.col||''}{r.pos&&<span style={{color:'var(--tx3)'}}> ({r.pos})</span>}</td>
+            <td style={{padding:'2px 6px',textAlign:'center'}}>{r.read==null?'':r.read?<span style={{color:'#16a34a'}}>✓</span>:<span style={{color:'var(--tx3)'}}>–</span>}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+      <details style={{marginTop:8,fontSize:11}}><summary style={{cursor:'pointer',color:'var(--tx3)'}}>표를 글자로 (전체 선택 → 복사)</summary>
+        <textarea readOnly value={tsv} onFocus={e=>e.target.select()} style={{width:'100%',height:120,fontFamily:'var(--mono)',fontSize:10,marginTop:4}}/>
+      </details>
+    </div>
+  </div>);
+}
+
 function VwRenameDialog({dlg,root,busy,onCancel,onOk}){
   const[v,setV]=useState(dlg.value);
   const[alsoSrc,setAlsoSrc]=useState(true);
