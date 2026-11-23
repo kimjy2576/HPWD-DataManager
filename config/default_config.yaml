@@ -187,6 +187,7 @@ column_mappings:
     "DryFtemp": "HP_F_Temp"
     "Fan IPM Temp": "HP_FanIpmTemp"
     "HP Fan QCurrent": "HP Fan Q Current"
+    "Q Current": "HP Fan Q Current"     # AMS .dat (+.proj) 로 읽을 때 이름 (변환 코드와 같음)
     "_DRY_DUCT_IN_TEMP_": "Heatpump_DuctInTemp"
     "_DRY_DUCT_OUT_TEMP_": "Heatpump_DuctOutTemp"
     "_DRY_EVA_IN_TEMP_": "Heatpump_EvaInTemp"

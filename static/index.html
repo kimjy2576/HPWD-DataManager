@@ -1224,7 +1224,7 @@ const vwBase=n=>n.replace(/(_calc_formula|_merged_formula|_formula|_calc|_merged
 function ProjChannelsDialog({data,onClose}){
   const d=data;const at=d.attrs||[];
   const zl={normal:'계측',smart:'통신 패킷',stx:'STX',etx:'ETX'};
-  const tsv=[['#','구역',...at,'앱 열','읽음'].join('\t'),...(d.rows||[]).map((r,i)=>[i+1,zl[r.zone],...at.map(k=>r.attrs[k]??''),r.col||'',r.read==null?'':r.read?'O':'X'].join('\t'))].join('\n');
+  const tsv=[['#','구역',...at,'앱 열','읽음'].join('\t'),...(d.rows||[]).map((r,i)=>[i+1,zl[r.zone],...at.map(k=>r.attrs[k]??''),(r.col||'')+(r.std?' → '+r.std:''),r.read==null?'':r.read?'O':'X'].join('\t'))].join('\n');
   const h=d.pos_hints?.[0];
   return(<div onMouseDown={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,.35)',zIndex:2000,display:'flex',alignItems:'center',justifyContent:'center',padding:16}}>
     <div onMouseDown={e=>e.stopPropagation()} style={{background:'var(--bg)',border:'1px solid var(--bd2)',borderRadius:10,padding:18,width:'min(1000px,100%)',maxHeight:'90vh',display:'flex',flexDirection:'column',boxShadow:'0 12px 36px rgba(0,0,0,.25)'}}>
@@ -1235,9 +1235,17 @@ function ProjChannelsDialog({data,onClose}){
       </div>
       <div style={{fontSize:11,color:'var(--tx2)',lineHeight:1.7,marginBottom:8}}>
         <div>· 계측 채널 <b>{d.n_normal}개</b> — 모두 읽음 (각 4바이트 값)</div>
-        <div>· 통신 패킷(STX~ETX, {d.etx-d.stx-1}바이트) 안 채널 <b>{d.n_smart}개</b> — 이름이 같아 앱이 읽는 것 {d.n_smart_read}개 · 앱은 원 코드처럼 패킷에서 {d.n_app_smart}개 값을 정해진 바이트 위치로 꺼냄</div>
+        <div>· 통신 패킷(STX~ETX, {d.etx-d.stx-1}바이트) 안 채널 <b>{d.n_smart}개</b> — 앱이 읽는 것(✓) {d.n_smart_read}개 · 앱은 원 코드처럼 패킷에서 {d.n_app_smart}개 값을 정해진 바이트 위치로 꺼냄{(d.extra||[]).some(f=>f.pos!=null)?' + 아래 추가 변수':''}</div>
         <div>· 채널 속성: {at.join(', ')||'-'}</div>
-        <div style={{color:h&&h.matched>=Math.max(3,h.known*0.7)?'#16a34a':'#b45309'}}>· {h?`숫자 속성 '${h.attr}' 이 원 코드의 바이트 위치와 ${h.known}개 중 ${h.matched}개 일치${h.shift?` (차이 ${h.shift})`:''}${h.matched>=Math.max(3,h.known*0.7)?' → 패킷 채널의 위치 정보로 보임 (모든 패킷 변수를 읽을 수 있을 가능성 높음)':' → 위치 정보로 보기 어려움'}`:'통신 패킷 채널에 원 코드 바이트 위치와 견줄 숫자 속성이 없음 (이름이 같은 채널이 3개 미만이거나 위치 속성 없음)'}</div>
+        {d.pos_check?<div style={{color:d.pos_check.ok?'#16a34a':'#b45309'}}>· {d.pos_check.ok
+          ?`숫자 속성 '${d.pos_check.attr}' 이 원 코드의 바이트 위치와 ${d.pos_check.matched[1]}개 중 ${d.pos_check.matched[0]}개 일치${d.pos_check.shift?` (차이 ${d.pos_check.shift})`:''} → 패킷 채널의 위치 정보로 확인됨 (이름이 달라도 같은 위치면 ✓)`
+          :`패킷 채널의 위치 정보 확인 안 됨 — ${d.pos_check.why}`}</div>
+        :<div style={{color:h&&h.matched>=Math.max(3,h.known*0.7)?'#16a34a':'#b45309'}}>· {h?`숫자 속성 '${h.attr}' 이 원 코드의 바이트 위치와 ${h.known}개 중 ${h.matched}개 일치${h.shift?` (차이 ${h.shift})`:''}${h.matched>=Math.max(3,h.known*0.7)?' → 패킷 채널의 위치 정보로 보임':' → 위치 정보로 보기 어려움'}`:'통신 패킷 채널에 원 코드 바이트 위치와 견줄 숫자 속성이 없음 (이름이 같은 채널이 3개 미만이거나 위치 속성 없음)'}</div>}
+        {(d.extra||[]).map(f=><div key={f.name} style={{color:f.pos!=null||f.normal?'#16a34a':f.missing?'var(--tx2)':'#b45309'}}>· 원 코드 외 추가 변수 <b>{f.name}</b>{f.std?` (→ ${f.std})`:''}: {f.normal
+          ?`계측 채널로 읽음 (${f.col})`
+          :f.pos!=null
+          ?`읽음 — '${f.attr}' 속성으로 찾은 패킷 위치 ${f.pos}${f.size===2?'~'+(f.pos+1):''} (${f.size}바이트${f.how!=='크기 속성'?', 크기는 '+f.how+'으로 추정':''}, 원 코드 위치와 ${f.matched?.[1]}개 중 ${f.matched?.[0]}개 일치)`
+          :`못 읽음 — ${f.why}`}</div>)}
         {d.others?.length>0&&<div>· 같은 폴더의 다른 프로젝트 파일: {d.others.join(', ')}</div>}
       </div>
       <div style={{overflow:'auto',border:'1px solid var(--bd)',borderRadius:6,flex:1,minHeight:120}}>
@@ -1247,7 +1255,7 @@ function ProjChannelsDialog({data,onClose}){
             <td style={{padding:'2px 6px',color:'var(--tx3)',textAlign:'left'}}>{i+1}</td>
             <td style={{padding:'2px 6px',whiteSpace:'nowrap',textAlign:'left'}}>{zl[r.zone]}</td>
             {at.map(k=><td key={k} style={{padding:'2px 6px',fontFamily:'var(--mono)',whiteSpace:'nowrap',textAlign:'left'}}>{r.attrs[k]??''}</td>)}
-            <td style={{padding:'2px 6px',fontFamily:'var(--mono)',whiteSpace:'nowrap',color:'var(--tx2)',textAlign:'left'}}>{r.col||''}{r.pos&&<span style={{color:'var(--tx3)'}}> ({r.pos})</span>}</td>
+            <td style={{padding:'2px 6px',fontFamily:'var(--mono)',whiteSpace:'nowrap',color:'var(--tx2)',textAlign:'left'}}>{r.col||''}{r.std&&<span style={{color:'#2563eb'}}> → {r.std}</span>}{r.pos&&<span style={{color:'var(--tx3)'}}> ({r.pos})</span>}</td>
             <td style={{padding:'2px 6px',textAlign:'center'}}>{r.read==null?'':r.read?<span style={{color:'#16a34a'}}>✓</span>:<span style={{color:'var(--tx3)'}}>–</span>}</td>
           </tr>)}</tbody>
         </table>

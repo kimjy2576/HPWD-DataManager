@@ -587,11 +587,20 @@ def _proj_channels(R: Report, proj: Path, mask: bool):
         R.add(f"  프로젝트 파일 {proj.name} 채널 정의를 읽을 수 없음: {e}")
         return
     R.add(f"  프로젝트 파일 {t['proj']} 채널: 계측 {t['n_normal']}개 (모두 읽음) · 통신 패킷(STX~ETX) 안 {t['n_smart']}개 "
-          f"(이름이 같아 앱이 읽는 것 {t['n_smart_read']}개, 앱이 패킷에서 꺼내는 값 {t['n_app_smart']}개)")
+          f"(앱이 읽는 것 {t['n_smart_read']}개, 앱이 원 코드 위치로 패킷에서 꺼내는 값 {t['n_app_smart']}개)")
     R.add(f"    채널 속성: {', '.join(t['attrs'])}")
     h = t["pos_hints"][0] if t["pos_hints"] else None
     R.add("    " + (f"숫자 속성 '{h['attr']}' 이 원 코드 바이트 위치와 {h['known']}개 중 {h['matched']}개 일치 (차이 {h['shift']})"
                      if h else "통신 패킷 채널에 원 코드 바이트 위치와 견줄 숫자 속성 없음"))
+    pc = t.get("pos_check") or {}
+    R.add("    패킷 위치 정보: " + ("확인됨" if pc.get("ok") else f"확인 안 됨 — {pc.get('why', '-')}"))
+    for f in t.get("extra") or []:      # 원 코드 48개 외에 더 읽는 변수 (Heatpump_Comp Current 등)
+        if f.get("normal"):
+            R.flag("ok", f"{f['name']}: 계측 채널로 읽음 ({f.get('col')})")
+        elif "pos" in f:
+            R.flag("ok", f"{f['name']}: .proj 위치 {f['pos']} ({f['size']}바이트, {f['how']}) 에서 읽음")
+        else:
+            R.flag("info" if f.get("missing") else "warn", f"{f['name']}: 못 읽음 — {f['why']}")
     if not mask:
         sm = [r for r in t["rows"] if r["zone"] == "smart"]
         for r in sm[:120]:

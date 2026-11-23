@@ -19,6 +19,8 @@ hpwd-studio-task 이슈 #13 의 변환 코드(AMS_Data.dat + *.proj → AMS_Data
     (값은 원 코드와 같음. AMS 프로그램 CSV 와 같은 배율 표기라 앱의 AMS 배율 설정이 그대로 적용됨)
   · 계측 채널 값이 NaN/inf 면 원 코드는 0, 여기선 빈 값
   · 채널 이름의 한자(功率·耗电 등)는 '_' 로 바꾸지 않고 둠 (앱의 AMS 이름 매핑이 그대로 적용)
+  · 원 코드 48개 외에 EXTRA_SMART(Heatpump_Comp Current)를 .proj 패킷 채널 정의의 위치에서 더 읽음
+    — .proj 의 숫자 속성이 원 코드 바이트 위치와 맞아 위치 정보로 확인될 때만 (아니면 이유를 로그에)
 """
 from __future__ import annotations
 
@@ -320,6 +322,10 @@ def layout_for(dat_path, why: list | None = None) -> dict | None:
         ep_name, ep_off = _pick_epoch(c["t_med"]) if c.get("t_med") is not None else (None, None)
         found = dict(L, rec=c["rec"], rec_proj=L["rec"], check=_check_text(c), weak=weak,
                      epoch=ep_name, epoch_off=ep_off)
+        try:       # 원 코드 48개 외 변수(EXTRA_SMART)의 패킷 위치 — 못 구해도 읽기는 그대로
+            found["extra"] = _extra_from_table(channel_table(q))
+        except Exception as e:
+            found["extra"] = [{"name": n, "why": f".proj 채널 정의를 해석하지 못함 ({e})"} for n in EXTRA_SMART]
         reason = ""
     _LAYOUT_CACHE[key] = (found, reason)
     if found is None and why is not None:
@@ -447,13 +453,32 @@ def read(dat_path, nrows: int | None = None, log=print, layout: dict | None = No
     A = np.frombuffer(buf, np.uint8, count=n * rec).reshape(n, rec)
     ts = np.ascontiguousarray(A[:, :8]).view("<f8").ravel()
     cols = {"Time": _times(ts, L.get("epoch_off"))}
-    held = []
+    held, extra_log = [], []
     if L["stx"] is not None:
         P = A[:, L["stx"]:min(L["etx"], rec)]
         for name, v in _smart_columns(P):
             if isinstance(v, _Held):
                 held.append(name)
             cols[name] = np.asarray(v)
+        # 원 코드 48개 외 변수 — .proj 통신 패킷 정의의 위치에서 (2바이트는 원 코드처럼 앞 바이트*256 + 뒤 바이트)
+        normal = {_norm(c) for c, _, _ in L["chans"]}
+        for f in L.get("extra") or []:
+            if f.get("normal") or f["name"] in cols or _norm(f["name"]) in normal:
+                continue                      # 계측 채널로 읽힘 (또는 이미 있는 열)
+            if "pos" not in f:
+                if "why" in f:
+                    extra_log.append(f"{'' if f.get('missing') else '⚠️ '}{f['name']} 못 읽음 — {f['why']}")
+                continue
+            q0, sz = int(f["pos"]), int(f["size"])
+            if q0 + sz > P.shape[1]:
+                extra_log.append(f"⚠️ {f['name']} 못 읽음 — 위치 {q0} 가 이 파일의 패킷({P.shape[1]}바이트) 밖")
+                continue
+            v = P[:, q0].astype(np.float64)
+            if sz == 2:
+                v = v * 256 + P[:, q0 + 1]
+            cols[f["name"]] = v
+            extra_log.append(f"{f['name']} 도 읽음 — .proj 통신 패킷 정의 위치 {q0} ({sz}바이트, "
+                             f"'{f.get('attr', '')}' 속성{', 크기는 ' + f['how'] if f.get('how') != '크기 속성' else ''})")
     for name, s, e in L["chans"]:
         if e > rec:
             continue
@@ -479,6 +504,8 @@ def read(dat_path, nrows: int | None = None, log=print, layout: dict | None = No
         f"{', 끝 바이트 차이 보정' if rec != L.get('rec_proj', rec) else ''}"
         f"{', 시각 기준일 ' + L['epoch'] if L.get('epoch') and L['epoch'] != 'Unix 1970' else ''}"
         f"{', 날짜를 알 수 없어 시각만' if not L.get('epoch') else ''})")
+    for m in extra_log:
+        log(f"  [ams_dat] {p.name}: {m}")
     if L.get("weak"):
         log(f"  [ams_dat] {p.name}: ⚠️ 시각 값이 예상과 달라 확인하지 못하고 원 코드처럼 그대로 읽음 — {L.get('check', '')}")
     return df
@@ -629,9 +656,190 @@ def channel_table(proj_path) -> dict:
             d, cnt = max(((d, diffs.count(d)) for d in set(diffs)), key=lambda x: x[1])
             hints.append({"attr": k, "matched": cnt, "known": len(diffs), "shift": d})
     hints.sort(key=lambda h: -h["matched"])
-    return {
+    t = {
         "proj": Path(proj_path).name, "attrs": attrs, "rows": rows, "rec": L["rec"], "stx": L["stx"], "etx": L["etx"],
         "n_normal": sum(1 for r in rows if r["zone"] == "normal"),
-        "n_smart": len(smart), "n_smart_read": sum(1 for r in smart if r["read"]),
         "n_app_smart": len(read_names) - 1, "pos_hints": hints,
     }
+    # 원 코드 48개 외에 .proj 위치로 더 꺼내는 변수 (EXTRA_SMART) — 읽히면 표에 ✓
+    t["extra"] = _extra_from_table(t)
+    ok_extra = {_norm(f["name"]): f for f in t["extra"] if "pos" in f}
+    sp = _smart_positions_from_table(t)
+    t["pos_check"] = {"ok": sp["ok"], "why": sp["why"], "attr": sp.get("attr"), "shift": sp.get("shift"),
+                      "matched": sp.get("matched")}
+    pos2col = {}       # 위치 정보를 믿을 수 있으면: 이름이 달라도 원 코드가 읽는 위치면 그 열 (예: 'HP Fan QCurrent' = 116 'Q Current')
+    if sp["ok"]:
+        for k, v in KNOWN_POS.items():
+            if not isinstance(v, tuple) and k in read_names:
+                pos2col.setdefault(v, (read_names[k], 2 if k in _KNOWN_2B else 1))
+
+    def span(p, size):
+        return f"패킷 {p}" if size == 1 else f"패킷 {p}~{p + size - 1}"
+
+    for r in smart:
+        n = _norm(r["attrs"].get("Name", ""))
+        kp = KNOWN_POS.get(n)
+        if r["read"]:
+            if kp is not None:
+                r["pos"] = (f"패킷 {kp[0]}, 종류 {kp[1]}" if isinstance(kp, tuple)
+                            else span(kp, 2 if n in _KNOWN_2B else 1))
+        elif n in ok_extra:
+            f = ok_extra[n]
+            r.update(read=True, col=f["name"], pos=span(f["pos"], f["size"]))
+        elif sp["ok"]:
+            v = _num(r["attrs"].get(sp["attr"]))
+            hit = pos2col.get(v - sp["shift"]) if v is not None else None
+            if hit:
+                r.update(read=True, col=hit[0], pos=span(v - sp["shift"], hit[1]))
+    t["n_smart"], t["n_smart_read"] = len(smart), sum(1 for r in smart if r["read"])
+    return t
+
+
+# ──────────────────────────────────────────────
+#  원 코드 48개 외의 통신 패킷 변수 (.proj 정의의 바이트 위치로)
+# ──────────────────────────────────────────────
+# 원 코드에는 없지만 AMS CSV 에는 있는 변수 — .proj 의 통신 패킷 채널 정의로 위치를 찾아 읽음
+EXTRA_SMART = ("Heatpump_Comp Current",)
+
+# 원 코드 값 중 2바이트인 것 (나머지 고정 영역 값은 1바이트) — .proj 크기 정보·간격 추정 확인용
+_KNOWN_2B = {"currentrpm", "requestrpm", "absiqeref", "iqeref", "vibfy", "vibry", "eev", "eevcurrentposition",
+             "fanspeed", "dryftemp", "superheatdegree", "qcurrent"}
+_MUX_FROM = 155          # 원 코드: 이 위치부터는 패킷 종류([3])마다 뜻이 바뀜
+_SIZE_KEYS = ("size", "length", "len", "byte", "bytes", "bytecount", "bytesize", "datasize", "datalength", "datalen")
+_TYPE_KEYS = ("datatype", "dtype", "valuetype", "vartype", "format", "data_type", "datatypename")
+
+
+def _size_attr(a: dict):
+    """채널 속성에서 크기(바이트) — 모르면 None, 비트면 0."""
+    low = {str(k).lower(): v for k, v in a.items()}
+    for k in _SIZE_KEYS:
+        if k in low and _num(low[k]) in (1, 2, 4, 8):
+            return _num(low[k])
+    for k in _TYPE_KEYS:
+        if k not in low:
+            continue
+        v = re.sub(r"[\s_]", "", str(low[k]).lower())
+        m = re.search(r"(?<!\d)(8|16|32|64)-?bit", v)                  # '16bit', '16-bit', '16 Bit Unsigned'
+        if m:
+            return int(m.group(1)) // 8
+        m = re.search(r"(?<!\d)([1248])-?bytes?", v)                     # '2byte', '2bytes'
+        if m:
+            return int(m.group(1))
+        if "bit" in v or "bool" in v:
+            return 0
+        if any(s in v for s in ("64", "double", "qword")):
+            return 8
+        if any(s in v for s in ("32", "dword", "float", "single", "long", "real")):
+            return 4
+        if any(s in v for s in ("16", "word", "short")):
+            return 2
+        if any(s in v for s in ("8", "byte", "char")):
+            return 1
+    return None
+
+
+def _verify_pos_attr(t: dict, h: dict):
+    """숫자 속성 h 를 패킷 바이트 위치로 믿을 수 있나 → (맞은 수, 견준 수, 못 믿는 이유 | "").
+    · 고정 구역(패킷 종류마다 안 바뀌는 곳) 원 코드 값들이 거의 다 (80% 이상, 3개 이상) 같은 차이로 맞아야 하고
+    · 맞은 채널들이 .proj 순서대로 1씩만 늘어나면 위치가 아니라 순번일 수 있으므로 (1바이트 값이 이어질 때 우연히 맞음) 안 믿음."""
+    fixed, i = [], 0
+    for r in t["rows"]:
+        if r["zone"] != "smart":
+            continue
+        i += 1
+        kp = KNOWN_POS.get(_norm(r["attrs"].get("Name", "")))
+        v = _num(r["attrs"].get(h["attr"]))
+        if kp is not None and not isinstance(kp, tuple) and v is not None:
+            fixed.append((i, v - h["shift"], kp))
+    hits = [(i, kp) for i, p, kp in fixed if p == kp]
+    a, n = len(hits), len(fixed)
+    if a < 3 or a < 0.8 * n:
+        return a, n, (f".proj 통신 패킷 채널의 '{h['attr']}' 값이 원 코드 바이트 위치와 {n}개 중 "
+                      f"{a}개만 맞아 위치로 믿을 수 없음")
+    if all(k2 - k1 == i2 - i1 for (i1, k1), (i2, k2) in zip(hits, hits[1:])):
+        return a, n, (f".proj 통신 패킷 채널의 '{h['attr']}' 값이 원 코드 위치와 맞긴 하지만 "
+                      f"맞은 {a}개가 .proj 순서대로 1씩 늘어나는 값뿐이라 위치인지 순번인지 알 수 없음")
+    return a, n, ""
+
+
+def _smart_positions_from_table(t: dict) -> dict:
+    """통신 패킷 채널의 바이트 위치(STX = 0)·크기 — 위치 속성이 원 코드 위치와 맞을 때만.
+    크기: 크기·자료형 속성이 있으면 그것, 없으면 다음 채널까지 간격(1 이면 1바이트, 그 이상이면 2바이트) —
+    이 추정이 원 코드 값들의 크기와 맞는지도 확인."""
+    if not t.get("pos_hints"):
+        return {"ok": False, "chans": {},
+                "why": ".proj 통신 패킷 채널에 바이트 위치로 볼 속성이 없음 (원 코드 변수와 이름이 같은 채널이 3개 미만이거나 숫자 속성 없음)"}
+    first_why = None
+    for h in t["pos_hints"]:
+        fixed_ok, fixed_n, why = _verify_pos_attr(t, h)
+        if not why:
+            break
+        first_why = first_why or why
+    else:
+        return {"ok": False, "chans": {}, "why": first_why}
+    plen = (t["etx"] - t["stx"]) if t.get("stx") is not None else 0
+    smart = []
+    for r in t["rows"]:
+        if r["zone"] == "smart":
+            v = _num(r["attrs"].get(h["attr"]))
+            if v is not None:
+                smart.append((r["attrs"].get("Name", ""), v - h["shift"], _size_attr(r["attrs"])))
+    poss = sorted({p for _, p, _ in smart})
+
+    def gap_size(p):
+        nxt = [q for q in poss if q > p]
+        return 1 if ((nxt[0] - p) if nxt else (plen - 1 - p)) <= 1 else 2
+
+    agree = tot = 0
+    for name, p, sz in smart:
+        n = _norm(name)
+        if n in KNOWN_POS and not isinstance(KNOWN_POS[n], tuple):
+            tot += 1
+            agree += (sz if sz is not None else gap_size(p)) == (2 if n in _KNOWN_2B else 1)
+    chans = {name: (p, sz if sz is not None else gap_size(p), "크기 속성" if sz is not None else "다음 채널까지 간격")
+             for name, p, sz in smart}
+    return {"ok": True, "why": "", "attr": h["attr"], "shift": h["shift"], "chans": chans,
+            "size_check": (agree, tot), "plen": plen, "matched": (fixed_ok, fixed_n)}
+
+
+def _extra_from_table(t: dict) -> list:
+    """EXTRA_SMART 각각 → {"name", "pos", "size", "how"} (패킷에서 읽음) | {"name", "normal", "col"} (계측 채널로 이미 읽음)
+    | {"name", "why"} (못 읽는 이유; .proj 에 그 이름이 아예 없으면 "missing")."""
+    sp = _smart_positions_from_table(t)
+    by = {_norm(k): (k, v) for k, v in sp["chans"].items()}
+    smart_names = {_norm(r["attrs"].get("Name", "")) for r in t["rows"] if r["zone"] == "smart"}
+    normal = {_norm(r["attrs"].get("Name", "")): r.get("col") for r in t["rows"] if r["zone"] == "normal"}
+    out = []
+    for name in EXTRA_SMART:
+        n = _norm(name)
+        if n not in smart_names:
+            if n in normal:
+                out.append({"name": name, "normal": True, "col": normal[n]})
+            else:
+                out.append({"name": name, "why": ".proj 에 이 이름의 채널이 없음", "missing": True})
+            continue
+        if not sp["ok"]:
+            out.append({"name": name, "why": sp["why"]})
+            continue
+        hit = by.get(n)
+        if hit is None:
+            out.append({"name": name, "why": f".proj 의 이 채널에 위치 속성 '{sp['attr']}' 값이 없음"})
+            continue
+        p, size, how = hit[1]
+        agree, tot = sp["size_check"]
+        if size == 0:
+            why = "비트 값으로 정의됨 — 아직 지원 안 함"
+        elif size not in (1, 2):
+            why = f"{size}바이트 값으로 정의됨 — 정수/실수 형식 확인 필요 (원 코드 값은 1·2바이트뿐)"
+        elif p >= _MUX_FROM:
+            why = f"위치 {p} 는 패킷 종류마다 뜻이 바뀌는 구간이라 종류 정보가 필요함"
+        elif p < 1 or p + size > sp["plen"]:
+            why = f"위치 {p} 가 패킷 범위를 벗어남"
+        elif how != "크기 속성" and tot and agree < 0.8 * tot:
+            why = f"크기 속성이 없고, 간격으로 추정한 크기가 원 코드 값과 {tot}개 중 {agree}개만 맞음"
+        else:
+            out.append({"name": name, "pos": int(p), "size": int(size), "how": how,
+                        "proj_name": hit[0], "attr": sp["attr"], "shift": sp["shift"], "matched": sp["matched"]})
+            continue
+        out.append({"name": name, "why": why})
+    return out

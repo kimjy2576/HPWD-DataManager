@@ -1695,6 +1695,15 @@ def ams_proj_channels(req: AmsProjReq):
         raise HTTPException(400, f"{projs[0].name} 을(를) 읽을 수 없음: {e}")
     t["match"] = bool(lay)
     t["others"] = [q.name for q in ams_proj.find_proj(dat) if q != projs[0]]
+    # 앱 열 → 병합 때 바뀌는 이름 (Setting 의 AMS 이름 매핑) — 예: Q Current → HP Fan Q Current
+    ams_map = (DEFAULT_CFG.get("column_mappings", {}) or {}).get("ams", {}) or {}
+    for r in t["rows"]:
+        std = ams_map.get(r.get("col") or "")
+        if std and std != r["col"]:
+            r["std"] = std
+    for f in t.get("extra") or []:
+        if ams_map.get(f["name"]):
+            f["std"] = ams_map[f["name"]]
     return t
 
 
