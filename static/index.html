@@ -144,9 +144,11 @@ return(<div className="cd"><div className="ct">데이터 경로</div>
 const projChip=(()=>{const ds=fl.filter(e=>e.proj);if(!ds.length)return null;
   const okN=ds.filter(e=>e.proj.match).length,hasN=ds.filter(e=>e.proj.files.length).length;
   const useDat=ds.some(e=>e.src==='ams'),useCsv=fl.some(e=>e.src==='ams'&&/\.csv$/i.test(e.file));
-  const tip=ds.map(e=>`${e.file}: ${e.proj.match?`.proj ✓ ${e.proj.match}`:e.proj.files.length?`.proj 가 이 .dat 와 안 맞음 (${e.proj.files.join(', ')})${e.proj.why?' — '+e.proj.why:''}`:'같은 폴더에 .proj 없음'} · ${e.src==='ams'?'AMS 로 사용':'사용 안 함'+(e.why?' — '+e.why:'')}`).join('\n');
+  const tip=ds.map(e=>`${e.file}: ${e.proj.match?`.proj ✓ ${e.proj.match}`:e.proj.files.length?`.proj 가 이 .dat 와 안 맞음 (${e.proj.files.join(', ')})${e.proj.why?' — '+e.proj.why:''}`:'같은 폴더에 .proj 없음'} · ${e.src==='ams'?'AMS 로 사용':'사용 안 함'+(e.why?' — '+e.why:'')}`
+    +(e.proj.extra||[]).filter(x=>!x.missing).map(x=>`\n   ${x.name}: ${x.ok?'읽음 — '+x.how:'못 읽음 — '+x.why}`).join('')).join('\n');
+  const exBad=ds.some(e=>e.src==='ams'&&(e.proj.extra||[]).some(x=>!x.ok&&!x.missing));
   let txt,tone;
-  if(okN===ds.length){txt=useDat?'AMS ← .dat (.proj ✓)':useCsv?'AMS ← CSV (.dat·.proj 도 있음)':'.dat·.proj ✓';tone=useDat?'ok':'mute'}
+  if(okN===ds.length){txt=useDat?'AMS ← .dat (.proj ✓)'+(exBad?' · 일부 변수 못 읽음':''):useCsv?'AMS ← CSV (.dat·.proj 도 있음)':'.dat·.proj ✓';tone=useDat?(exBad?'warn':'ok'):'mute'}
   else{txt=`.dat ${ds.length-okN}개 ${hasN<ds.length?'.proj 없음':'.proj 안 맞음'}${useCsv?' → AMS ← CSV':''}`;tone=useCsv?'mute':'warn'}
   const st=tone==='ok'?{background:'rgba(22,163,74,.1)',color:'#16a34a'}:tone==='warn'?{background:'rgba(234,179,8,.14)',color:'#b45309'}:{background:'var(--bg2)',color:'var(--tx3)'};
   return<span title={tip} style={{fontSize:10,padding:'1px 6px',borderRadius:4,cursor:'help',...st}}>{tone==='warn'?'⚠️ ':''}{txt}</span>})();
@@ -727,7 +729,10 @@ const loadMapping=e=>{
   const f=e.target.files[0];if(!f)return;
   const r=new FileReader();r.onload=ev=>{
     try{const proj=JSON.parse(ev.target.result);
-    if(proj.mapping){setMapping(proj.mapping);
+    if(proj.mapping){const pm={...proj.mapping};
+      // 예전 키: 압축기 토출(바디) 온도 T_Comp_Body → 원래 이름 Heatpump_CompTemp
+      if('T_Comp_Body' in pm){if(!pm.Heatpump_CompTemp)pm.Heatpump_CompTemp=pm.T_Comp_Body;delete pm.T_Comp_Body}
+      proj.mapping=pm;setMapping(pm);
       const um=calcVars.filter(v=>v.required&&!proj.mapping[v.key]).map(v=>v.key);
       setUnmatched(um);alert(`매핑 불러오기 완료: ${Object.values(proj.mapping).filter(Boolean).length}개 연결`);
     }else alert('유효한 매핑 파일이 아닙니다')}catch(err){alert('파일 오류: '+err.message)}
@@ -1182,7 +1187,7 @@ const PSYCH_BG=(()=>{const out=[];
 })();
 
 const VW_CATS=[
-  {name:'압축기 상태량',rows:3,cols:3,vars:['P_Comp_In','P_Comp_Out','T_Comp_In','T_Comp_Body','T_Superheating','T_SH_CompOut','Ratio_Compression','Eta_vol','HP_CompCurrentHz']},
+  {name:'압축기 상태량',rows:3,cols:3,vars:['P_Comp_In','P_Comp_Out','T_Comp_In','Heatpump_CompTemp','T_Superheating','T_SH_CompOut','Ratio_Compression','Eta_vol','HP_CompCurrentHz']},
   {name:'증발기 상태량',rows:3,cols:3,vars:['T_Air_Eva_In','T_Air_Eva_Out','T_Eva_In','T_Eva_Out','T_Boiling_ref','T_Superheating','RH_Eva_In','AH_Eva_In','AH_Eva_In_raw']},
   {name:'응축기 상태량',rows:3,cols:3,vars:['T_Air_Eva_Out','T_Air_Cond_Out','T_Cond_In','T_Cond_Out','T_Cond_M1','T_subcooling','RH_Cond_Out','AH_Cond_Out']},
   {name:'유량',rows:3,cols:3,vars:['Flow_air_Cond_CMM','Flow_air_Cond_CMM_raw','Flow_air_Eva_CMM','Flow_ref_kgH','Flow_ref_kgH_recalc','Flow_ref_kgH_raw','Water_calc_gM','Water_calc_kg','Water_calc_kg_raw']},
@@ -1238,14 +1243,20 @@ function ProjChannelsDialog({data,onClose}){
         <div>· 통신 패킷(STX~ETX, {d.etx-d.stx-1}바이트) 안 채널 <b>{d.n_smart}개</b> — 앱이 읽는 것(✓) {d.n_smart_read}개 · 앱은 원 코드처럼 패킷에서 {d.n_app_smart}개 값을 정해진 바이트 위치로 꺼냄{(d.extra||[]).some(f=>f.pos!=null)?' + 아래 추가 변수':''}</div>
         <div>· 채널 속성: {at.join(', ')||'-'}</div>
         {d.pos_check?<div style={{color:d.pos_check.ok?'#16a34a':'#b45309'}}>· {d.pos_check.ok
-          ?`숫자 속성 '${d.pos_check.attr}' 이 원 코드의 바이트 위치와 ${d.pos_check.matched[1]}개 중 ${d.pos_check.matched[0]}개 일치${d.pos_check.shift?` (차이 ${d.pos_check.shift})`:''} → 패킷 채널의 위치 정보로 확인됨 (이름이 달라도 같은 위치면 ✓)`
+          ?`숫자 속성 '${d.pos_check.attr}'${{bit:' (비트 위치 ÷8)',last:' (값의 마지막 바이트 위치)'}[d.pos_check.tf]||''} 이 원 코드의 바이트 위치와 ${d.pos_check.matched[1]}개 중 ${d.pos_check.matched[0]}개 일치${d.pos_check.shift?` (차이 ${d.pos_check.shift})`:''} → 패킷 채널의 위치 정보로 확인됨 (이름이 달라도 같은 위치면 ✓)`
           :`패킷 채널의 위치 정보 확인 안 됨 — ${d.pos_check.why}`}</div>
         :<div style={{color:h&&h.matched>=Math.max(3,h.known*0.7)?'#16a34a':'#b45309'}}>· {h?`숫자 속성 '${h.attr}' 이 원 코드의 바이트 위치와 ${h.known}개 중 ${h.matched}개 일치${h.shift?` (차이 ${h.shift})`:''}${h.matched>=Math.max(3,h.known*0.7)?' → 패킷 채널의 위치 정보로 보임':' → 위치 정보로 보기 어려움'}`:'통신 패킷 채널에 원 코드 바이트 위치와 견줄 숫자 속성이 없음 (이름이 같은 채널이 3개 미만이거나 위치 속성 없음)'}</div>}
+        {(d.found_log||[]).map((m,i)=><div key={'fl'+i} style={{color:'#16a34a'}}>· {m.replace(/^\[ams_dat\]\s*/,'')}</div>)}
         {(d.extra||[]).map(f=><div key={f.name} style={{color:f.pos!=null||f.normal?'#16a34a':f.missing?'var(--tx2)':'#b45309'}}>· 원 코드 외 추가 변수 <b>{f.name}</b>{f.std?` (→ ${f.std})`:''}: {f.normal
           ?`계측 채널로 읽음 (${f.col})`
           :f.pos!=null
-          ?`읽음 — '${f.attr}' 속성으로 찾은 패킷 위치 ${f.pos}${f.size===2?'~'+(f.pos+1):''} (${f.size}바이트${f.how!=='크기 속성'?', 크기는 '+f.how+'으로 추정':''}, 원 코드 위치와 ${f.matched?.[1]}개 중 ${f.matched?.[0]}개 일치)`
-          :`못 읽음 — ${f.why}`}</div>)}
+          ?`읽음 — 패킷 ${f.pos}${f.size===2?'~'+(f.pos+1):''} (${f.size}바이트${f.a&&f.a!==1?`, ×${f.a}`:''}) · ${f.how||''}${f.matched?`, 원 코드 위치와 ${f.matched[1]}개 중 ${f.matched[0]}개 일치`:''}${f.learned?`, ${(f.learned.agree*100).toFixed(1)}% 일치`:''}${f.note?` · ${f.note}`:''}`
+          :`못 읽음 — ${f.why}${f.why_csv?` · CSV: ${f.why_csv}`:f.missing?'':' · 같은 측정의 AMS CSV 를 .dat 와 같은 폴더에 두고 이 창을 다시 열면(또는 Merge 하면) 위치를 찾아 기억함'}`}
+          {f.pos==null&&!f.normal&&f.xml&&<div style={{marginTop:3}}>
+            <div style={{display:'flex',alignItems:'center',gap:6}}><span style={{color:'var(--tx3)'}}>.proj 안 이 채널 정의 (측정값 없음 — 위치를 맞출 때 이 내용을 보내 주세요)</span>
+              <button className="bt bs" style={{fontSize:10,padding:'0 6px'}} onClick={()=>{const x=[f.xml,...Object.entries(d.xml||{}).filter(([k])=>k!==f.proj_name&&k!==f.name).map(([,v])=>v)].join('\n');navigator.clipboard?.writeText(x).catch(()=>{})}}>복사</button></div>
+            <pre style={{margin:'2px 0 0',padding:'4px 6px',background:'var(--bg2)',border:'1px solid var(--bd)',borderRadius:4,whiteSpace:'pre-wrap',wordBreak:'break-all',fontSize:10,maxHeight:120,overflow:'auto',color:'var(--tx2)'}}>{[f.xml,...Object.entries(d.xml||{}).filter(([k])=>k!==f.proj_name&&k!==f.name).map(([,v])=>v)].join('\n')}</pre>
+          </div>}</div>)}
         {d.others?.length>0&&<div>· 같은 폴더의 다른 프로젝트 파일: {d.others.join(', ')}</div>}
       </div>
       <div style={{overflow:'auto',border:'1px solid var(--bd)',borderRadius:6,flex:1,minHeight:120}}>
@@ -1823,7 +1834,7 @@ const VL={
   // 압력
   P_Comp_In:'흡입 압력 [barg]',P_Comp_Out:'토출 압력 [barg]',P_Eva_In:'증발 압력 [barg]',P_Cond_Out:'응축 압력 [barg]',
   // 온도 — 압축기
-  T_Comp_In:'압축기 흡입 온도 [°C]',T_Comp_Out:'압축기 토출 온도 [°C]',T_Comp_Body:'압축기 토출 온도(바디) [°C]',
+  T_Comp_In:'압축기 흡입 온도 [°C]',T_Comp_Out:'압축기 토출 온도 [°C]',Heatpump_CompTemp:'압축기 토출 온도(바디) [°C]',T_Comp_Body:'압축기 토출 온도(바디) [°C]',
   // 온도 — 응축기
   T_Cond_In:'응축기 냉매 입구 온도 [°C]',T_Cond_Out:'응축기 냉매 출구 온도 [°C]',T_Cond_M1:'응축기 중간 온도 [°C]',
   T_Air_Cond_Out:'응축기 공기 출구 온도 [°C]',T_Dew_ref:'응축 온도 (이슬점) [°C]',T_subcooling:'과냉도 [K]',
@@ -1882,7 +1893,7 @@ const VL={
   // 제어
   Ctrl_Comp_Hz:'압축기 주파수 [Hz]',HP_CompCurrentHz:'압축기 주파수 [Hz]',HP_CompTargetHz:'압축기 목표 주파수 [Hz]',
   HP_F_Temp:'F 온도 [°C]',HP_EEV_Position:'팽창밸브 개도 [pulse]',HP_FanSpeed:'팬 회전수 [rpm]',
-  'HP Fan Q Current':'팬 전류 [A]','HP Comp Current':'압축기 전류 [A]',
+  'HP Fan Q Current':'팬 전류','HP Comp Current':'압축기 전류',
   HP_SuperHeatDegree:'과열도 (센서) [K]',HP_CoolingFan:'쿨링팬 [-]',HP_CompIpmTemp:'IPM 온도 [°C]',HP_FanIpmTemp:'팬 IPM 온도 [°C]',
   Ctrl_DryMotion:'건조 모션 [-]',
   // 기타 merged
@@ -1917,11 +1928,13 @@ function VwChart({vwRef,modeReq,cases,caseVis,caseColors,lw,setLw,chartH,setChar
       const derived=new Set(cases.flatMap(c=>c?.derived||[]));
       return[...s].filter(k=>!derived.has(k)&&!(VW_ALIAS_SRC[k]&&s.has(VW_ALIAS_SRC[k])));
     }
-    // 표준 모드: 라벨(VL) 기준 가나다 정렬
-    return[...s].sort((a,b)=>(VL[a]||a).localeCompare(VL[b]||b,'ko'));
+    // 표준 모드: 라벨(VL) 기준 가나다 정렬 (예전 파일의 T_Comp_Body 는 Heatpump_CompTemp 복사본이라 원본이 있으면 숨김)
+    return[...s].filter(k=>!(k==='T_Comp_Body'&&s.has('Heatpump_CompTemp'))).sort((a,b)=>(VL[a]||a).localeCompare(VL[b]||b,'ko'));
   },[cases,mode]);
   // 표시 이름 — 원본 모드에선 원본명을 앞에 두고 아는 의미를 덧붙임
   const lab=k=>{
+    // 원본 모드: AMS 원래 이름(Heatpump_CompTemp 등)은 이름을 앞에 두고 뜻을 덧붙임
+    if(mode==='merge'&&VW_ALIAS_OF[k]){const h=VL[k]||VL[VW_ALIAS_OF[k]];return h?`${k} · ${h}`:k}
     if(mode!=='merge'||VL[k])return VL[k]||k;
     const h=VL[VW_ALIAS_OF[k]];
     return h?`${k} · ${h}`:k;

@@ -1066,6 +1066,16 @@ def save_default_merge_settings(req: dict):
     return {"saved": len(data["variable_settings"]), "path": str(p)}
 
 
+def _calc_map_compat(m: dict) -> dict:
+    """예전 Calc 변수 키 → 지금 키 (압축기 토출(바디) 온도: T_Comp_Body → 원래 이름 Heatpump_CompTemp)."""
+    m = dict(m or {})
+    if "T_Comp_Body" in m:
+        v = m.pop("T_Comp_Body")
+        if not m.get("Heatpump_CompTemp"):
+            m["Heatpump_CompTemp"] = v
+    return m
+
+
 @app.get("/api/default-calc-mapping")
 def get_default_calc_mapping():
     """기본 Calculation 변수 매핑 반환."""
@@ -1073,7 +1083,10 @@ def get_default_calc_mapping():
     p = BASE_DIR / "config" / "calc_mapping_default.json"
     if not p.exists():
         return {"mapping": {}}
-    return json.loads(p.read_text("utf-8"))
+    d = json.loads(p.read_text("utf-8"))
+    if isinstance(d, dict) and isinstance(d.get("mapping"), dict):
+        d["mapping"] = _calc_map_compat(d["mapping"])
+    return d
 
 
 @app.post("/api/save-default-calc-mapping")
@@ -1292,6 +1305,17 @@ def _case_entries(case_dir: Path, file_rules: dict | None, sources: list | None,
             e["proj"] = {"files": [q.name for q in ams_proj.find_proj(x)],
                          "match": Path(lay["proj"]).name if lay else None,
                          "why": "" if lay else (pw[0] if pw else "")}
+            if lay:
+                if csvs:   # .proj 로 위치를 못 찾은 패킷 변수(Heatpump_Comp Current)는 같은 측정 AMS CSV 로 찾아 기억 (처음 한 번)
+                    try:
+                        ams_proj.ensure_extra(x, lay, log=lambda *_: None)
+                    except Exception as ex:
+                        print(f"  [ams_proj] {x.name}: 같은 측정 CSV 로 위치 찾기 실패 — {ex}")
+                e["proj"]["extra"] = [{"name": f["name"], "ok": "pos" in f or bool(f.get("normal")),
+                                       "missing": bool(f.get("missing")),
+                                       "how": f.get("how") or ("계측 채널" if f.get("normal") else ""),
+                                       "why": f.get("why", "") + (f" · CSV: {f['why_csv']}" if f.get("why_csv") else "")}
+                                      for f in lay.get("extra") or []]
         if kind == "binary" and nl.endswith(".dat") and (e["auto"] == "ams" or e["src"] == "ams"):
             # AMS 바이너리 .dat — 같은 폴더 .proj 로 읽히거나 학습한 형식이 있어야 읽힘
             how = ams_dat.readable(str(x), size=e["size"])
@@ -1689,10 +1713,22 @@ def ams_proj_channels(req: AmsProjReq):
     projs = [Path(lay["proj"])] if lay else ams_proj.find_proj(dat)
     if not projs:
         raise HTTPException(404, "같은 폴더에 AMS 프로젝트 파일(.proj)이 없음")
+    found_log = []
+    if lay:     # .proj 로 위치를 못 찾은 변수는 같은 폴더의 같은 측정 AMS CSV 로 찾아 기억 (찾으면 표에 반영)
+        try:
+            ams_proj.ensure_extra(dat, lay, log=found_log.append)
+        except Exception as e:
+            found_log.append(f"⚠️ 같은 측정 AMS CSV 로 위치 찾기 실패 ({type(e).__name__}: {e})")
     try:
         t = ams_proj.channel_table(projs[0])
     except Exception as e:
         raise HTTPException(400, f"{projs[0].name} 을(를) 읽을 수 없음: {e}")
+    if lay:     # CSV 로 못 찾은 이유도 함께
+        why_csv = {f["name"]: f.get("why_csv") for f in lay.get("extra") or [] if f.get("why_csv")}
+        for f in t.get("extra") or []:
+            if "pos" not in f and why_csv.get(f["name"]):
+                f["why_csv"] = why_csv[f["name"]]
+    t["found_log"] = [m.strip() for m in found_log]
     t["match"] = bool(lay)
     t["others"] = [q.name for q in ams_proj.find_proj(dat) if q != projs[0]]
     # 앱 열 → 병합 때 바뀌는 이름 (Setting 의 AMS 이름 매핑) — 예: Q Current → HP Fan Q Current
@@ -2638,13 +2674,24 @@ def _run_calc(sid: str, cfg: dict, source_files: list[str],
 
             # 변수 매핑 적용 (있으면)
             if var_map:
-                rename_dict = {}
+                var_map = _calc_map_compat(var_map)
+                # 그 자체로 Calc 변수인 열(예: Heatpump_CompTemp, T_Comp_Out)은 다른 키로 매핑돼도 이름을 바꾸지 않고 복사
+                as_is = ({c for k, c in var_map.items() if k == c} | {v["key"] for v in CALC_VARIABLES}
+                         | {"Heatpump_CompTemp"})
+                rename_dict, copies = {}, {}
                 for calc_var, merged_col in var_map.items():
                     if merged_col in df.columns and calc_var != merged_col:
-                        rename_dict[merged_col] = calc_var
+                        if merged_col in as_is or merged_col in rename_dict:
+                            copies[calc_var] = merged_col
+                        else:
+                            rename_dict[merged_col] = calc_var
+                for calc_var, merged_col in copies.items():
+                    if calc_var not in df.columns:
+                        df[calc_var] = df[merged_col]
                 if rename_dict:
                     df = df.rename(columns=rename_dict)
-                    _log(sid, f"  변수 매핑: {len(rename_dict)}개 적용")
+                if rename_dict or copies:
+                    _log(sid, f"  변수 매핑: {len(rename_dict) + len(copies)}개 적용")
 
             # 압력 재계산 (Merge에서 잘못 계산됐을 수 있으므로)
             from calculator import _calc_pressures
@@ -2786,7 +2833,7 @@ CALC_VARIABLES = [
     {"key": "T_Cond_In",       "label": "응축기 냉매 입구 온도",  "unit": "°C",  "category": "냉매 온도", "required": True,  "default_match": ["T_Cond_In", "T_Comp_Out", "Heatpump_CompTemp"]},
     {"key": "T_Cond_Out",      "label": "응축기 냉매 출구 온도",  "unit": "°C",  "category": "냉매 온도", "required": True,  "default_match": ["T_Cond_Out"]},
     {"key": "T_Cond_Mid",      "label": "응축기 냉매 중간 온도",  "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Cond_Mid", "T_Cond_M1"]},
-    {"key": "T_Comp_Body",     "label": "압축기 토출 온도(바디)",   "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_Body", "Heatpump_CompTemp", "T_Comp_Out"]},
+    {"key": "Heatpump_CompTemp", "label": "압축기 토출 온도(바디)", "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["Heatpump_CompTemp", "T_Comp_Body", "T_Comp_Out"]},
     {"key": "T_Eva_Out",       "label": "증발기 냉매 출구 온도",  "unit": "°C",  "category": "냉매 온도", "required": True,  "default_match": ["T_Eva_Out", "Heatpump_EvaOutTemp"]},
     {"key": "T_Comp_In",       "label": "압축기 흡입 온도",      "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_In", "Heatpump_EvaOutTemp", "T_Eva_Out"]},
     {"key": "T_Comp_Out",      "label": "압축기 토출 온도",      "unit": "°C",  "category": "냉매 온도", "required": False, "default_match": ["T_Comp_Out", "T_Cond_In"]},

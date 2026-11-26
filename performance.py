@@ -38,12 +38,12 @@ def run_stage2(df: pd.DataFrame, cfg: dict, exp: dict | None = None, filename: s
     BLOCKS = {
         "condenser_air":  {"required": [["T_Air_Eva_Out", "T_Air_Eva_In"], ["T_Air_Cond_Out"]],
                            "label": "응축기 공기측"},
-        "condenser_ref":  {"required": [["T_Cond_In", "T_Comp_Out", "T_Comp_Body"], ["T_Cond_Out"], ["P_Comp_Out"]],
+        "condenser_ref":  {"required": [["T_Cond_In", "T_Comp_Out", "Heatpump_CompTemp"], ["T_Cond_Out"], ["P_Comp_Out"]],
                            "label": "응축기 냉매측"},
         "evaporator_ref": {"required": [["P_Comp_In"], ["T_Eva_Out"]],
                            "label": "증발기 냉매측", "depends": ["condenser_ref"]},
         "compressor_ref": {"required": [["T_Comp_In", "T_Eva_Out"], ["P_Comp_In"],
-                                         ["T_Cond_In", "T_Comp_Body"], ["P_Comp_Out"]],
+                                         ["T_Cond_In", "Heatpump_CompTemp"], ["P_Comp_Out"]],
                            "label": "압축기 냉매측"},
         "mass_flow":      {"label": "질량유량 & 열전달",
                            "depends": ["condenser_air", "condenser_ref", "evaporator_ref", "compressor_ref"]},
@@ -283,7 +283,6 @@ def _ensure_columns(df):
         "Heatpump_EvaInTemp": "T_Eva_In",
         "Heatpump_DuctInTemp": "T_Air_Eva_In",
         "Heatpump_DuctOutTemp": "T_Air_Cond_Out",
-        "Heatpump_CompTemp": "T_Comp_Body",
         "HP_CompCurrentHz": "Ctrl_Comp_Hz",
         "Heatpump_DryMotionInfo": "Ctrl_DryMotion",
         "T_Cond_M1": "T_Cond_Mid",
@@ -292,11 +291,14 @@ def _ensure_columns(df):
     for old, new in rename_map.items():
         if old in df.columns and new not in df.columns:
             df[new] = df[old]
+    # 압축기 토출(바디) 온도는 원래 이름(Heatpump_CompTemp) 그대로 씀 — 예전 파일에 T_Comp_Body 만 있으면 그 값으로
+    if "Heatpump_CompTemp" not in df.columns and "T_Comp_Body" in df.columns:
+        df["Heatpump_CompTemp"] = df["T_Comp_Body"]
 
     # ── 폴백: 없는 컬럼은 대체 컬럼에서 복제 ──
     fallbacks = [
         ("T_Comp_In",      ["T_Eva_Out"]),
-        ("T_Comp_Out",     ["T_Cond_In", "T_Comp_Body"]),
+        ("T_Comp_Out",     ["T_Cond_In", "Heatpump_CompTemp"]),
         ("T_Air_Eva_In",   ["T_Eva_In"]),
         ("T_Air_Cond_Out", ["T_Air_Eva_In"]),
     ]
@@ -324,7 +326,6 @@ def _ensure_columns(df):
         "Heatpump_EvaInTemp": "T_Eva_In",
         "Heatpump_DuctInTemp": "T_Air_Eva_In",
         "Heatpump_DuctOutTemp": "T_Air_Cond_Out",
-        "Heatpump_CompTemp": "T_Comp_Body",
         "HP_CompCurrentHz": "Ctrl_Comp_Hz",
     }
     for orig, unified in reverse_map.items():
@@ -406,7 +407,7 @@ def _calc_condenser_air(df, rh_eva_out, patm):
 def _calc_condenser_ref(df, props):
     T_in = df["T_Cond_In"].values.astype(float) if "T_Cond_In" in df.columns \
         else df["T_Comp_Out"].values.astype(float) if "T_Comp_Out" in df.columns \
-        else df["T_Comp_Body"].values.astype(float)
+        else df["Heatpump_CompTemp"].values.astype(float)
     T_out = df["T_Cond_Out"].values.astype(float) if "T_Cond_Out" in df.columns \
         else df["T_Air_Cond_Out"].values.astype(float)
     T_m1 = df["T_Cond_Mid"].values.astype(float) if "T_Cond_Mid" in df.columns else T_out
@@ -476,7 +477,7 @@ def _calc_compressor_ref(df, props):
         else df["T_Eva_Out"].values.astype(float)
     P_in = df["P_Comp_In"].values.astype(float)
     T_out = df["T_Cond_In"].values.astype(float) if "T_Cond_In" in df.columns \
-        else df["T_Comp_Body"].values.astype(float)
+        else df["Heatpump_CompTemp"].values.astype(float)
     P_out = df["P_Comp_Out"].values.astype(float)
 
     h_in = props.h_tp_superheat(T_in, P_in)

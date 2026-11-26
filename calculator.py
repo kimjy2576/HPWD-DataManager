@@ -17,7 +17,7 @@ STD_ALIASES = {
     "T_Air_Cond_Out": ("Heatpump_DuctOutTemp",),  # 응축기 공기 출구 (= 덕트 출구)
     "T_Eva_In":       ("Heatpump_EvaInTemp",),    # 증발기 냉매 입구
     "T_Eva_Out":      ("Heatpump_EvaOutTemp",),   # 증발기 냉매 출구
-    "T_Comp_Body":    ("Heatpump_CompTemp",),     # 압축기 토출(바디)
+    # 압축기 토출(바디) 온도는 원래 이름 Heatpump_CompTemp 그대로 씀 (T_Comp_Body 로 바꾸지 않음)
 }
 
 
@@ -125,7 +125,7 @@ def _calc_pressures(df, props, patm):
         print(f"  [P_Comp_Out] ← psat(T_Cond_M1), 범위: {p.min():.2f}~{p.max():.2f} barg")
     elif "P_Comp_Out" not in df.columns:
         # T_Cond_In → 과열이라 psat이 약간 높음 (근사)
-        for c in ["T_Cond_In", "T_Comp_Out", "T_Comp_Body"]:
+        for c in ["T_Cond_In", "T_Comp_Out", "Heatpump_CompTemp", "T_Comp_Body"]:
             if c in df.columns:
                 p = props.psat_t_barg(df[c].values)
                 df["P_Comp_Out"] = p; df["P_Cond_Out"] = p
