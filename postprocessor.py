@@ -227,17 +227,28 @@ def apply_low_pass_filter(
 def filter_time_interval(df, interval):
     return df[df["Time_sec"] % interval == 0].copy()
 
+def dry_start_min(F, min_hz):
+    """건조 시작 시각 [min] — 압축기 목표 주파수가 처음 min_hz 이상이 된 때 (예전 'Dry_Only' 의 잘라내기 기준).
+    알 수 없으면 None. Visualization 의 '건조만' 정렬도 같은 기준."""
+    if "HP_CompTargetHz" not in F.columns or "Time_min" not in F.columns:
+        return None
+    run = pd.to_numeric(F["HP_CompTargetHz"], errors="coerce") >= min_hz
+    return float(F.loc[run, "Time_min"].iloc[0]) if run.any() else None
+
+
 def filter_dry_cycle_br(df, filter_mode, min_hz, last_min, time_interval):
+    """세탁+건조 전체를 남기고 끝(마지막 last_min 분 안에서 히트펌프가 멈춘 때)만 자름.
+    filter_mode 는 예전 설정 호환용 — 'Dry_Only' 를 줘도 이제 자르지 않음
+    (세탁/건조 구간은 Visualization 에서 골라 봄 — 건조만 보면 케이스마다 건조 시작 = 0분)."""
     F = filter_time_interval(df, time_interval)
 
     # 필터에 필요한 컬럼이 없으면 필터링을 건너뛴다 (Merge 실패 방지)
     need = ["HP_CompTargetHz", "HP_FanSpeed", "HP_EEV_Position"]
     missing = [c for c in need if c not in F.columns]
     if "HP_CompTargetHz" in missing or "Time_min" not in F.columns:
-        print(f"  [filter] 건조 구간 필터 건너뜀 — 컬럼 없음: {missing}")
+        print(f"  [filter] 끝 자르기 건너뜀 — 컬럼 없음: {missing} (세탁+건조 전체 그대로)")
         return F
 
-    cond_run = F["HP_CompTargetHz"] >= min_hz
     if not missing:
         cond_stop = ((F["HP_CompTargetHz"] == 0)
                      & (F["HP_FanSpeed"] == 0)
@@ -252,20 +263,15 @@ def filter_dry_cycle_br(df, filter_mode, min_hz, last_min, time_interval):
     cond_stop_tail = cond_stop.reindex(tail.index, fill_value=False)
     cycle_end = tail.loc[cond_stop_tail, "Time_min"].iloc[0] if cond_stop_tail.any() else end_min
 
-    if filter_mode == "Dry_Only":
-        if not cond_run.any():
-            return F
-        start_min = F.loc[cond_run, "Time_min"].iloc[0]
-        if cycle_end < start_min:
-            cycle_end = end_min
-        result = F[(F["Time_min"] >= start_min) & (F["Time_min"] < cycle_end)].copy()
-        n = len(result)
-        result["Time_sec"] = np.arange(0, n * time_interval, time_interval)
-        result["Time_min"] = result["Time_sec"] / 60
-        return result
-    elif filter_mode == "Wash_and_Dry":
-        return F[F["Time_min"] < cycle_end].copy()
-    return F
+    ds = dry_start_min(F, min_hz)
+    if ds is not None and cycle_end < ds:
+        cycle_end = end_min
+    out = F[F["Time_min"] < cycle_end].copy() if cycle_end < end_min else F.copy()
+    print(f"  [filter] 세탁+건조 그대로 {len(out):,}행 ({out['Time_min'].iloc[-1] if len(out) else 0:.1f}분까지)"
+          + (f" · 건조 시작 {ds:.1f}분 (압축기 목표 주파수 ≥ {min_hz:g} Hz)" if ds is not None
+             else " · 건조 시작을 알 수 없음 (압축기가 안 돈 데이터)")
+          + " — 세탁/건조는 Visualization 에서 골라 봄")
+    return out
 
 def filter_dry_cycle_mx100(df, time_interval):
     if "V1_Comp" in df.columns:
@@ -284,7 +290,7 @@ def run_postprocessing(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     filt = cfg["filtering"]
     spike = cfg["spike_removal"]
     setup = cfg["processing"]["setup_type"]
-    mode  = cfg["processing"]["filter_mode"]
+    mode  = "Wash_and_Dry"            # 필터 모드 설정은 없앰 — 항상 세탁+건조 (구간은 Visualization 에서 선택)
     interval = cfg["processing"]["time_interval"]
 
     df = apply_noise_removal(

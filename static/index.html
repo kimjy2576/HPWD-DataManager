@@ -1201,6 +1201,47 @@ const VW_CATS=[
 // ── 원본(Merge) 모드 ─────────────────────────────────────────────
 // Calc 없이 Merge 파일을 볼 때는 우리 표준명과 변수명이 다를 수 있으므로,
 // 파일에 실제로 있는 컬럼을 종류별로 자동 분류해 카테고리를 만든다.
+// ── 세탁/건조 구간 (Visualization 공통) ──
+// 건조 시작 = 압축기 목표 주파수가 처음 min_hz 이상이 된 때 (Merge 로그의 '건조 시작', 예전 Dry_Only 잘라내기와 같은 기준).
+// 그 열이 없으면 압축기 주파수 → 건조 모션(≥2) → MX100 압축기 전압(>0) 순서로 봄.
+const vwDryStart=(D,minHz)=>{
+  const rules=[
+    ['HP_CompTargetHz',v=>v>=minHz,`압축기 목표 주파수 ≥ ${minHz} Hz`],
+    ['HP_CompCurrentHz',v=>v>=minHz,`압축기 주파수 ≥ ${minHz} Hz`],
+    ['Ctrl_Comp_Hz',v=>v>=minHz,`압축기 주파수 ≥ ${minHz} Hz`],
+    ['Heatpump_DryMotionInfo',v=>v>=2,'건조 모션 ≥ 2'],
+    ['Ctrl_DryMotion',v=>v>=2,'건조 모션 ≥ 2'],
+    ['V1_Comp',v=>v>0,'압축기 전압 > 0'],
+  ];
+  for(const[k,ok,how] of rules){const a=D?.[k];if(!Array.isArray(a))continue;
+    const i=a.findIndex(v=>v!=null&&v!==''&&isFinite(+v)&&ok(+v));
+    if(i<0)continue;
+    const tm=D.Time_min?.[i]!=null?+D.Time_min[i]:(D.Time_sec?.[i]!=null?+D.Time_sec[i]/60:null);
+    const t0=D.Time_min?.[0]!=null?+D.Time_min[0]:(D.Time_sec?.[0]!=null?+D.Time_sec[0]/60:0);
+    return{idx:i,min:tm!=null?tm-t0:null,how,col:k}}
+  return null;
+};
+// 적산값(전력량·누적 응축수) — '건조만' 볼 때 건조 시작을 0 으로 다시 셈
+const vwIsCumul=k=>/^E_/.test(k)||/^Water_calc_kg/.test(k);
+// 케이스 데이터에 구간 적용: both = 전체, dry = 건조 시작부터, wash = 건조 시작 전까지. 어느 쪽이든 첫 행이 0분.
+const vwApplyPhase=(c,ph,dry)=>{
+  if(!c?.data)return c;
+  const D=c.data;
+  const n=c.rows||Math.max(0,...Object.values(D).map(a=>Array.isArray(a)?a.length:0));
+  const ds=dry?.idx;
+  let s=0,e=n;
+  if(ds!=null){if(ph==='dry')s=ds;else if(ph==='wash')e=ds}
+  const tm0=D.Time_min?.[s]!=null?+D.Time_min[s]:null,ts0=D.Time_sec?.[s]!=null?+D.Time_sec[s]:null;
+  const out={};
+  for(const[k,a] of Object.entries(D)){
+    if(!Array.isArray(a)){out[k]=a;continue}
+    let b=(s===0&&e>=a.length)?a:a.slice(s,e);
+    if(k==='Time_min'&&tm0!=null&&tm0!==0)b=b.map(v=>v==null?v:+(v-tm0).toFixed(6));
+    else if(k==='Time_sec'&&ts0!=null&&ts0!==0)b=b.map(v=>v==null?v:+(v-ts0).toFixed(3));
+    else if(ph==='dry'&&s>0&&vwIsCumul(k)){const b0=a[s];if(b0!=null&&isFinite(+b0))b=b.map(v=>v==null||!isFinite(+v)?v:+(v-b0).toFixed(6))}
+    out[k]=b}
+  return{...c,data:out,rows:Math.max(0,e-s),phase:ph,phaseRange:[s,e]};
+};
 const VW_ALIAS_SRC={T_Air_Eva_In:'Heatpump_DuctInTemp',T_Air_Cond_Out:'Heatpump_DuctOutTemp',T_Eva_In:'Heatpump_EvaInTemp',T_Eva_Out:'Heatpump_EvaOutTemp',T_Comp_Body:'Heatpump_CompTemp'};
 const VW_ALIAS_OF=Object.fromEntries(Object.entries(VW_ALIAS_SRC).map(([a,b])=>[b,a]));
 const VW_CALC_SIG=['Flow_ref_kgH','Qrefr_Cond','Qrefr_Eva','COP','SMER','Water_calc_kg','RMC_calc'];
@@ -1337,6 +1378,15 @@ const[legacy,setLegacy]=useState(()=>{try{
   return(f.length||Object.keys(m).length)?{folders:f,map:m}:null}catch{return null}});
 const[selFiles,setSelFiles]=useState(new Set());
 const[cases,setCases]=useState([]);  // [{name,data:{col:[...]}}]
+// 세탁/건조 구간 — 둘 다 = 세탁건조, 하나만 = 그 구간만 (모든 그래프 탭 공통, 이 브라우저에 기억)
+const[phaseSel,setPhaseSel]=useState(()=>{try{const v=JSON.parse(localStorage.getItem('vw_phase')||'null');if(v&&(v.wash||v.dry))return{wash:!!v.wash,dry:!!v.dry}}catch{}return{wash:true,dry:true}});
+useEffect(()=>{try{localStorage.setItem('vw_phase',JSON.stringify(phaseSel))}catch{}},[phaseSel]);
+const phase=phaseSel.wash&&phaseSel.dry?'both':phaseSel.dry?'dry':'wash';
+const togPhase=k=>setPhaseSel(p=>{const n={...p,[k]:!p[k]};return(n.wash||n.dry)?n:p});   // 둘 다 끌 수는 없음
+const minHz=+(cfg?.filtering?.min_hz??10)||10;
+const dryOf=useMemo(()=>Object.fromEntries(cases.map(c=>[c.name,vwDryStart(c.data,minHz)])),[cases,minHz]);
+const viewCases=useMemo(()=>phase==='both'&&cases.every(c=>!(c.data?.Time_min?.[0]||c.data?.Time_sec?.[0]))?cases
+  :cases.map(c=>vwApplyPhase(c,phase,dryOf[c.name])),[cases,phase,dryOf]);
 const[caseVis,setCaseVis]=useState({});
 const[caseColors,setCaseColors]=useState({}); // {caseName: '#hex'}
 const[loading,setLoading]=useState(false);
@@ -1801,7 +1851,15 @@ return(<div>
 
   {/* 공통 컨트롤 — 케이스 */}
   <div style={{marginBottom:6,padding:'8px 12px',background:'var(--bg2)',border:'1px solid var(--bd)',borderRadius:8}}>
-    <div style={{fontSize:11,fontWeight:500,color:'var(--tx2)',marginBottom:6}}>케이스 ({cases.length}개)</div>
+    <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap',marginBottom:6}}>
+      <div style={{fontSize:11,fontWeight:500,color:'var(--tx2)'}}>케이스 ({cases.length}개)</div>
+      <span style={{flex:1}}/>
+      <span style={{fontSize:11,fontWeight:500,color:'var(--tx2)'}}>구간</span>
+      {[['wash','세탁'],['dry','건조']].map(([k,lb])=><label key={k} title={phaseSel[k]&&!phaseSel[k==='wash'?'dry':'wash']?'하나는 켜 둬야 함':''} style={{display:'flex',alignItems:'center',gap:3,fontSize:12,cursor:'pointer'}}>
+        <input type="checkbox" checked={phaseSel[k]} onChange={()=>togPhase(k)}/>{lb}</label>)}
+      <span style={{fontSize:10,color:'var(--tx3)'}}>{phase==='dry'?'건조만 — 케이스마다 건조 시작 = 0분 (전력량 E_*·누적 응축수도 건조 시작부터)'
+        :phase==='wash'?'세탁만 — 처음 = 0분, 건조 시작 전까지':'세탁+건조 — 처음(세탁 시작) = 0분'}</span>
+    </div>
     <div style={{maxHeight:160,overflowY:'auto'}}>
     {cases.map((c,i)=>{const col=caseColors[c.name]||VW_COLORS[i%VW_COLORS.length];
       const moveCase=(from,to)=>{if(to<0||to>=cases.length)return;setCases(prev=>{const a=[...prev];[a[from],a[to]]=[a[to],a[from]];return a})};
@@ -1813,6 +1871,11 @@ return(<div>
         <input type="color" value={col} onChange={e=>setCaseColors(p=>({...p,[c.name]:e.target.value}))} title="색상 변경" style={{width:18,height:18,padding:0,border:'1px solid var(--bd2)',borderRadius:3,cursor:'pointer'}}/>
         <button style={{flex:1,display:'flex',alignItems:'center',gap:5,padding:'2px 8px',border:'1px solid var(--bd2)',borderRadius:4,background:caseVis[c.name]?'var(--bg3)':'transparent',opacity:caseVis[c.name]?1:.3,cursor:'pointer',fontFamily:'var(--mono)',fontSize:11,color:'var(--tx)',textAlign:'left'}} onClick={()=>setCaseVis(p=>({...p,[c.name]:!p[c.name]}))}>
           <span style={{width:8,height:8,borderRadius:'50%',background:col,flexShrink:0}}/><span style={{overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.label||c.name}</span>
+          {(()=>{const d=dryOf[c.name],vc=viewCases.find(v=>v.name===c.name);
+            const empty=vc&&vc.rows===0;
+            return<span title={d?`건조 시작: ${d.how} 인 첫 시점 (${d.col})`:'압축기·건조 모션 값이 없어 건조 시작을 알 수 없음 — 어느 구간이든 전체 표시'}
+              style={{marginLeft:'auto',flexShrink:0,fontSize:10,fontFamily:'var(--font)',color:empty?'#b45309':'var(--tx3)'}}>
+              {empty?(phase==='wash'?'세탁 구간 없음':'건조 구간 없음'):d?(d.min!=null?`건조 시작 ${d.min.toFixed(1)}분`:'건조 시작 ?'):'건조 시작 모름 → 전체'}</span>})()}
         </button>
         <button onClick={()=>{const n=prompt('케이스 이름:',c.label||c.name);if(n)setCases(prev=>prev.map(cc=>cc.name===c.name?{...cc,label:n}:cc))}} title="이름 변경" style={{padding:'2px 4px',border:'1px solid var(--bd2)',borderRadius:3,background:'var(--bg3)',color:'var(--tx3)',cursor:'pointer',fontSize:9}}>✏️</button>
         <button onClick={()=>{if(cases.length<=1){alert('최소 1개 케이스 필요');return}if(!confirm(`"${c.label||c.name}" 삭제?`))return;setCases(prev=>prev.filter(cc=>cc.name!==c.name));setCaseVis(p=>{const n={...p};delete n[c.name];return n})}} title="삭제" style={{padding:'2px 4px',border:'1px solid var(--bd2)',borderRadius:3,background:'var(--bg3)',color:'var(--red)',cursor:'pointer',fontSize:9}}>×</button>
@@ -1821,10 +1884,10 @@ return(<div>
   </div>
 
   <ErrorBound>
-  <div style={{display:sub==='chart'?'block':'none'}}><VwChart vwRef={vwChartRef} modeReq={modeReq} cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} setDragMode={setDragMode} xGap={xGap} setXGap={setXGap} yGap={yGap} setYGap={setYGap}/></div>
-  <div style={{display:sub==='psych'?'block':'none'}}><VwPsych cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode}/></div>
-  <div style={{display:sub==='ph'?'block':'none'}}><VwPh cases={cases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} cfg={cfg}/></div>
-  <div style={{display:sub==='perf'?'block':'none'}}><VwPerf cases={cases} caseVis={caseVis} caseColors={caseColors} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW}/></div>
+  <div style={{display:sub==='chart'?'block':'none'}}><VwChart vwRef={vwChartRef} modeReq={modeReq} cases={viewCases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} setDragMode={setDragMode} xGap={xGap} setXGap={setXGap} yGap={yGap} setYGap={setYGap} phase={phase}/></div>
+  <div style={{display:sub==='psych'?'block':'none'}}><VwPsych cases={viewCases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode}/></div>
+  <div style={{display:sub==='ph'?'block':'none'}}><VwPh cases={viewCases} caseVis={caseVis} caseColors={caseColors} lw={lw} setLw={setLw} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW} dragMode={dragMode} cfg={cfg}/></div>
+  <div style={{display:sub==='perf'?'block':'none'}}><VwPerf cases={viewCases} caseVis={caseVis} caseColors={caseColors} chartH={chartH} setChartH={setChartH} chartW={chartW} setChartW={setChartW}/></div>
   </ErrorBound>
   </>}
 </div>)}
@@ -1903,7 +1966,7 @@ const VL={
 const yTitle=k=>VL[k]?`<b>${VL[k]}</b>`:`<b>${k}</b>`;
 
 // ═══ Viewer: 라인차트 ═══
-function VwChart({vwRef,modeReq,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chartW,setChartW,dragMode,setDragMode,xGap,setXGap,yGap,setYGap}){
+function VwChart({vwRef,modeReq,cases,caseVis,caseColors,lw,setLw,chartH,setChartH,chartW,setChartW,dragMode,setDragMode,xGap,setXGap,yGap,setYGap,phase}){
   // 변수명 모드: 자동 / 표준(Calc) / 원본(Merge)
   const[vmode,setVmode]=useState(()=>{try{return localStorage.getItem('vwc_mode')||'auto'}catch{return'auto'}});
   useEffect(()=>{try{localStorage.setItem('vwc_mode',vmode)}catch{}},[vmode]);
@@ -2062,7 +2125,7 @@ function VwChart({vwRef,modeReq,cases,caseVis,caseColors,lw,setLw,chartH,setChar
       };
       nPlots.forEach((k,pi)=>{
         const xk='x'+(pi+1>1?pi+1:''),yk='y'+(pi+1>1?pi+1:'');
-        lo['xaxis'+(pi+1)]={title:Math.floor(pi/actC)+1===actR?{text:wrapB('Time [min]'),font:titleFont}:undefined,gridcolor:'rgba(0,0,0,0.06)',tickfont:tickFont,zeroline:false,linecolor:'rgba(0,0,0,0.15)',linewidth:1,mirror:true,autorange:true};
+        lo['xaxis'+(pi+1)]={title:Math.floor(pi/actC)+1===actR?{text:wrapB(phase==='dry'?'Time [min] — 건조 시작 = 0':'Time [min]'),font:titleFont}:undefined,gridcolor:'rgba(0,0,0,0.06)',tickfont:tickFont,zeroline:false,linecolor:'rgba(0,0,0,0.15)',linewidth:1,mirror:true,autorange:true};
         lo['yaxis'+(pi+1)]={title:{text:wrapB(yTitleClean(k)),font:titleFont},gridcolor:'rgba(0,0,0,0.06)',tickfont:tickFont,zeroline:false,linecolor:'rgba(0,0,0,0.15)',linewidth:1,mirror:true,
           ...yRangeFor(k)};
         zones.forEach((z,zi)=>{shapes.push({type:'rect',xref:xk,yref:yk+' domain',x0:z.start,x1:z.end,y0:0,y1:1,fillcolor:VW_ZC[zi%VW_ZC.length],line:{color:VW_ZB[zi%VW_ZB.length],width:1,dash:'dot'},layer:'below'})});
@@ -2088,7 +2151,7 @@ function VwChart({vwRef,modeReq,cases,caseVis,caseColors,lw,setLw,chartH,setChar
       }
       else setErr('표시할 데이터 없음');
     }catch(e){console.error('VwChart:',e);setErr('렌더링 오류: '+e.message)}
-  },[cases,caseVis,caseColors,lw,chartH,finalW,tab,smOn,smM,smW,dragMode,zones,xGap,yGap,mode,containerW]);
+  },[cases,caseVis,caseColors,lw,chartH,finalW,tab,smOn,smM,smW,dragMode,zones,xGap,yGap,mode,containerW,phase]);
 
   // 구간 통계
   const zoneStats=useMemo(()=>zones.map(z=>{
@@ -3191,7 +3254,7 @@ return(<div><div className="fg"><div>
 <option value="csv">CSV 로 읽기 — AMS 프로그램·변환 코드로 내보낸 파일</option>
 </select></div></div>
 <div style={{fontSize:10,color:'var(--tx3)',margin:'-2px 0 8px'}}>같은 측정의 AMS .dat 와 CSV 가 둘 다 있을 때 어느 쪽을 읽을지 정합니다 (이름이 같거나, 시간이 겹치고 변수가 비슷하면 같은 측정으로 봄). 한쪽만 있으면 그 파일을 읽고, .dat 를 못 읽으면(.proj 없음) CSV 를 씁니다. 바꾼 뒤에는 Merge 탭에서 케이스 확정을 다시 누르세요.</div>
-<CfgField lb="기준 시간축" p="processing.data_time" o={['BR','AMS','MX100','NIDAQ']} {...fp}/><CfgField lb="필터 모드" p="processing.filter_mode" o={['Dry_Only','Wash_and_Dry']} {...fp}/><CfgField lb="리샘플링" p="processing.time_interval" t="number" u="초" {...fp}/></div>
+<CfgField lb="기준 시간축" p="processing.data_time" o={['BR','AMS','MX100','NIDAQ']} {...fp}/><CfgField lb="리샘플링" p="processing.time_interval" t="number" u="초" {...fp}/></div>
 <div className="cd"><div className="ct">시작 트림</div>
 <div style={{fontSize:10,color:'var(--tx3)',marginBottom:6}}>특정 변수가 기준값 이상인 시점부터 데이터를 사용합니다. 비활성 시 SW_ProtectionCount 기반.</div>
 <div className="fr"><div className="fl">활성</div><div className="fi"><label style={{display:'flex',alignItems:'center',gap:6,cursor:'pointer'}}><input type="checkbox" checked={l?.filtering?.start_trim?.enabled||false} onChange={e=>{const v=e.target.checked;const st=JSON.parse(JSON.stringify(l?.filtering?.start_trim||{enabled:false,column:'HP_CompTargetHz',min_value:10}));st.enabled=v;s('filtering.start_trim',st)}} style={{accentColor:'var(--teal)'}}/>{l?.filtering?.start_trim?.enabled?'사용 중 (변수 기준)':'비활성 (SW_ProtectionCount)'}</label></div></div>
