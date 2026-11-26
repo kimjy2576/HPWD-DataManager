@@ -57,8 +57,9 @@ filtering:
   lpf_tau: 15
   noise_window: 60
   noise_threshold: 5
-  min_hz: 10
-  last_min: 2
+  min_hz: 10                       # 건조 시작: 압축기 목표 주파수가 처음 이 값 이상이 된 때
+  last_min: 2                      # (SubProcess 로 건조 끝을 못 찾을 때) 마지막 몇 분 안에서 히트펌프 정지를 찾음
+  dry_end_subprocess: [6]          # 건조 끝: 건조 시작 뒤 SubProcess 가 이 값이 된 때부터 버림 (6 = HPDRY_COOLING_STEP 냉각)
 
   # 시작 트림: 특정 변수가 기준값 이상인 첫 시점부터 데이터 사용
   # enabled=false → 기존 방식 (SW_ProtectionCount > 0)

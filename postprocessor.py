@@ -236,40 +236,109 @@ def dry_start_min(F, min_hz):
     return float(F.loc[run, "Time_min"].iloc[0]) if run.any() else None
 
 
-def filter_dry_cycle_br(df, filter_mode, min_hz, last_min, time_interval):
-    """세탁+건조 전체를 남기고 끝(마지막 last_min 분 안에서 히트펌프가 멈춘 때)만 자름.
-    filter_mode 는 예전 설정 호환용 — 'Dry_Only' 를 줘도 이제 자르지 않음
+def dry_end_values(v) -> list:
+    """설정 filtering.dry_end_subprocess → 숫자 목록 ([6], 6, "6", "6, 64" 모두 받음). 비우면 []."""
+    if v is None:
+        return []
+    items = v if isinstance(v, (list, tuple)) else str(v).replace(";", ",").split(",")
+    out = []
+    for x in items:
+        try:
+            out.append(float(str(x).strip()))
+        except ValueError:
+            pass
+    return out
+
+
+def dry_end_min(F, start_min, end_vals, hold=3):
+    """건조 끝 [min] — 건조 시작 뒤 SubProcess 가 end_vals 중 하나가 된 첫 시각 (냉각 단계 등). 못 찾으면 (None, None).
+    hold 행 연속(데이터 끝이면 그만큼만) 그 값이어야 인정 — Merge 의 선형 보간이 코드 사이를 지나며
+    한 행만 6 이 되는 경우(예: 3 → 64 사이 빈 구간)는 건너뜀."""
+    if not end_vals or "SubProcess" not in F.columns or "Time_min" not in F.columns:
+        return None, None
+    sp = pd.to_numeric(F["SubProcess"], errors="coerce").to_numpy(float)
+    hit = np.isin(np.round(sp, 6), np.round(np.asarray(end_vals, float), 6))
+    if start_min is not None:
+        hit &= F["Time_min"].to_numpy(float) > start_min
+    n = len(hit)
+    for i in np.flatnonzero(hit):
+        j = min(n, i + hold)
+        if hit[i:j].all():
+            return float(F["Time_min"].iloc[i]), sp[i]
+    return None, None
+
+
+def subprocess_steps(F, max_steps=12, hold=3):
+    """SubProcess 가 바뀐 순서 — '2(20.0분) → 3(25.1분) → 6(55.3분)' (Merge 로그에서 건조 끝 값 확인용).
+    hold 행 넘게 이어진 정수 값만 셈 (보간으로 코드 사이를 지나간 값은 건너뜀)."""
+    if "SubProcess" not in F.columns or "Time_min" not in F.columns:
+        return ""
+    sp = pd.to_numeric(F["SubProcess"], errors="coerce").to_numpy(float)
+    tm = F["Time_min"].to_numpy(float)
+    runs, i, n = [], 0, len(sp)
+    while i < n:
+        j = i
+        while j + 1 < n and sp[j + 1] == sp[i]:
+            j += 1
+        v = sp[i]
+        if np.isfinite(v) and abs(v - round(v)) < 1e-6 and (j - i + 1 >= hold or j == n - 1):
+            if not runs or runs[-1][0] != v:
+                runs.append((v, tm[i]))
+        i = j + 1
+    if not runs:
+        return ""
+    steps = [f"{v:g}({t:.1f}분)" for v, t in runs]
+    more = len(steps) - max_steps
+    return " → ".join(steps[:max_steps]) + (f" → … ({more}번 더 바뀜)" if more > 0 else "")
+
+
+def filter_dry_cycle_br(df, filter_mode, min_hz, last_min, time_interval, end_vals=None):
+    """세탁+건조를 남기고 건조가 끝난 뒤는 자름.
+    · 건조 끝 = 건조 시작 뒤 SubProcess 가 end_vals(기본 6 = HPDRY_COOLING_STEP 냉각)가 된 때
+    · SubProcess 로 못 찾으면 예전처럼 마지막 last_min 분 안에서 히트펌프가 멈춘 때
+    filter_mode 는 예전 설정 호환용 — 'Dry_Only' 를 줘도 앞(세탁)은 자르지 않음
     (세탁/건조 구간은 Visualization 에서 골라 봄 — 건조만 보면 케이스마다 건조 시작 = 0분)."""
     F = filter_time_interval(df, time_interval)
-
-    # 필터에 필요한 컬럼이 없으면 필터링을 건너뛴다 (Merge 실패 방지)
-    need = ["HP_CompTargetHz", "HP_FanSpeed", "HP_EEV_Position"]
-    missing = [c for c in need if c not in F.columns]
-    if "HP_CompTargetHz" in missing or "Time_min" not in F.columns:
-        print(f"  [filter] 끝 자르기 건너뜀 — 컬럼 없음: {missing} (세탁+건조 전체 그대로)")
+    if "Time_min" not in F.columns or F.empty:
         return F
-
-    if not missing:
-        cond_stop = ((F["HP_CompTargetHz"] == 0)
-                     & (F["HP_FanSpeed"] == 0)
-                     & (F["HP_EEV_Position"] == 500))
-    else:
-        # 보조 컬럼이 없으면 압축기 정지만으로 판정
-        print(f"  [filter] 정지 판정 축소 — 없는 컬럼: {missing}")
-        cond_stop = (F["HP_CompTargetHz"] == 0)
-
     end_min = F["Time_min"].iloc[-1]
-    tail = F[F["Time_min"] >= (end_min - last_min)]
-    cond_stop_tail = cond_stop.reindex(tail.index, fill_value=False)
-    cycle_end = tail.loc[cond_stop_tail, "Time_min"].iloc[0] if cond_stop_tail.any() else end_min
-
     ds = dry_start_min(F, min_hz)
-    if ds is not None and cycle_end < ds:
-        cycle_end = end_min
+    de, de_val = dry_end_min(F, ds, end_vals or [])
+    if de is not None:
+        cycle_end, how_end = de, f"SubProcess = {de_val:g} 이 된 때"
+    elif "HP_CompTargetHz" not in F.columns:
+        print(f"  [filter] 건조 끝 자르기 건너뜀 — SubProcess {', '.join(f'{v:g}' for v in end_vals or []) or '-'} 도, "
+              f"HP_CompTargetHz 도 없음 (전체 그대로)")
+        return F
+    else:
+        # 예전 방식: 마지막 last_min 분 안에서 히트펌프가 멈춘 첫 시점
+        need = ["HP_CompTargetHz", "HP_FanSpeed", "HP_EEV_Position"]
+        missing = [c for c in need if c not in F.columns]
+        if not missing:
+            cond_stop = ((F["HP_CompTargetHz"] == 0)
+                         & (F["HP_FanSpeed"] == 0)
+                         & (F["HP_EEV_Position"] == 500))
+        else:
+            print(f"  [filter] 정지 판정 축소 — 없는 컬럼: {missing}")
+            cond_stop = (F["HP_CompTargetHz"] == 0)
+        tail = F[F["Time_min"] >= (end_min - last_min)]
+        cond_stop_tail = cond_stop.reindex(tail.index, fill_value=False)
+        cycle_end = tail.loc[cond_stop_tail, "Time_min"].iloc[0] if cond_stop_tail.any() else end_min
+        if ds is not None and cycle_end < ds:
+            cycle_end = end_min
+        why = ("SubProcess 열 없음" if "SubProcess" not in F.columns
+               else "설정 '건조 끝 SubProcess' 비어 있음" if not end_vals
+               else f"건조 시작 뒤 SubProcess 가 {', '.join(f'{v:g}' for v in end_vals)} 이 된 적 없음")
+        how_end = f"마지막 {last_min:g}분 안 히트펌프 정지 · {why}"
     out = F[F["Time_min"] < cycle_end].copy() if cycle_end < end_min else F.copy()
-    print(f"  [filter] 세탁+건조 그대로 {len(out):,}행 ({out['Time_min'].iloc[-1] if len(out) else 0:.1f}분까지)"
-          + (f" · 건조 시작 {ds:.1f}분 (압축기 목표 주파수 ≥ {min_hz:g} Hz)" if ds is not None
-             else " · 건조 시작을 알 수 없음 (압축기가 안 돈 데이터)")
+    steps = subprocess_steps(F)
+    if steps:
+        print(f"  [filter] SubProcess 순서: {steps}")
+    print(f"  [filter] 세탁+건조 {len(out):,}행 · "
+          + (f"건조 시작 {ds:.1f}분 (압축기 목표 주파수 ≥ {min_hz:g} Hz) · " if ds is not None
+             else "건조 시작을 알 수 없음 (압축기가 안 돈 데이터) · ")
+          + (f"건조 끝 {cycle_end:.1f}분 ({how_end}) → 그 뒤 {end_min - cycle_end:.1f}분 버림" if cycle_end < end_min
+             else f"끝까지 ({end_min:.1f}분, {how_end})")
           + " — 세탁/건조는 Visualization 에서 골라 봄")
     return out
 
@@ -302,7 +371,8 @@ def run_postprocessing(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     df = apply_low_pass_filter(df, filt["lpf_columns"], tau=filt.get("lpf_tau", 15))
 
     if setup == "BR":
-        df = filter_dry_cycle_br(df, mode, filt["min_hz"], filt["last_min"], interval)
+        df = filter_dry_cycle_br(df, mode, filt["min_hz"], filt["last_min"], interval,
+                                 dry_end_values(filt.get("dry_end_subprocess", [6])))
     else:
         df = filter_dry_cycle_mx100(df, interval)
 
